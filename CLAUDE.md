@@ -19,7 +19,9 @@ Omarchy overlay + bar-widget plugin. This checkout *is* the installed plugin
   `*.gpg` files, `omarchy bar set hegjon.passwordstore storeDir <dir>`, open
   the overlay, drive it with `wtype "git"` / `wtype -k Down`, screenshot with
   `grim -o HDMI-A-1` and `magick -crop`. The card is centered; on the
-  3840×2160 monitor `920x600+1460+780` frames it. Restore `storeDir ""`
+  3840×2160 monitor `1400x800+1220+680` frames it. Switch to an empty
+  workspace first (`hyprctl dispatch 'hl.dsp.focus({ workspace = "9" })'`) so only
+  the wallpaper is behind the card. Restore `storeDir ""`
   afterwards. `preview.png` is that crop.
 - Settings are read by the overlay from `shell.shellConfig.bar.layout`
   (the widget's bar entry), with `manifest.barWidget.defaults` as fallback.
