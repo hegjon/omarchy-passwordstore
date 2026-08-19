@@ -79,7 +79,7 @@ omarchy bar set hegjon.passwordstore allowTyping false --json
 | `clipTimeSec`    | `45`                         | Seconds until the clipboard is cleared (`PASSWORD_STORE_CLIP_TIME`).   |
 | `usernameKeys`   | `login,user,username,email`  | Field names that hold the username, matched case-insensitively.        |
 | `allowTyping`    | `true`                       | Enable `Ctrl+Enter` / `Ctrl+Shift+Enter` (needs `wtype`).               |
-| `notifyOnCopy`   | `true`                       | Notify when something was copied. Failures are always notified.         |
+| `notifyOnCopy`   | `true`                       | Notify when something was copied, naming the entry and its username. Failures are always notified.         |
 
 ## How it works
 
