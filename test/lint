@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# Run qmllint over the plugin's QML.
+#
+# qmllint ships with qt6-declarative, in Qt's versioned bin directory rather
+# than on PATH. Quickshell exposes the Omarchy shell's own modules under the
+# `qs` namespace, which it aliases at runtime; qmllint needs that spelled out,
+# hence the temporary import root below. The symlink is built outside the
+# plugin folder on purpose — omarchy-plugin-validate refuses any symlink
+# inside one.
+#
+# Two warning classes are expected and are not defects:
+#
+#   missing-property on Style.* / Color.*
+#       Those singletons expose nested QtObject groups that qmllint cannot
+#       introspect. First-party plugins report the same; weather/BarWidget.qml
+#       alone produces 15.
+#
+#   signal-handler-parameters on onExited
+#       Process.exited carries a QProcess::ExitStatus that qmllint cannot
+#       resolve without Qt private types. The handler only uses exitCode.
+#
+#   uncreatable-type on PanelWindow
+#       Quickshell's PanelWindow is created by every first-party overlay
+#       (emojis, clipboard, menu) and lints identically there.
+#
+# Anything else — especially [unqualified] — is worth fixing.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly SHELL_ROOT="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+readonly QML_ROOT="${OMARCHY_QML_ROOT:-/usr/lib/qt6/qml}"
+
+QMLLINT="$(command -v qmllint || true)"
+[[ -x $QMLLINT ]] || QMLLINT=/usr/lib/qt6/bin/qmllint
+if [[ ! -x $QMLLINT ]]; then
+  echo "lint: qmllint not found — install it with: omarchy pkg add qt6-declarative" >&2
+  exit 127
+fi
+[[ -d $SHELL_ROOT ]] || { echo "lint: Omarchy shell modules not found at $SHELL_ROOT" >&2; exit 1; }
+
+import_root=$(mktemp -d) || exit 1
+trap 'rm -rf "$import_root"' EXIT
+ln -sfn "$SHELL_ROOT" "$import_root/qs"
+
+status=0
+shopt -s nullglob
+for qml in "$PLUGIN_DIR"/*.qml; do
+  echo "qmllint ${qml#"$PLUGIN_DIR"/}"
+  output=$("$QMLLINT" -I "$QML_ROOT" -I "$import_root" "$qml" 2>&1)
+
+  # Drop the two expected classes, then report whatever is left.
+  remaining=$(grep -E '^(Warning|Error)' <<<"$output" |
+    grep -vE 'missing-property|signal-handler-parameters|uncreatable-type' || true)
+
+  if [[ -n $remaining ]]; then
+    printf '%s\n' "$remaining"
+    status=1
+  else
+    expected=$(grep -cE 'missing-property|signal-handler-parameters|uncreatable-type' <<<"$output")
+    printf '  clean (%s expected singleton/signal warnings suppressed)\n' "$expected"
+  fi
+done
+
+exit "$status"

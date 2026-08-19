@@ -1,0 +1,100 @@
+#!/bin/bash
+
+# Check manifest.json against the rules the Omarchy shell enforces.
+#
+# `omarchy plugin validate` is the authority and should be used on an Omarchy
+# machine. It does not exist on a CI runner, so this is a portable subset of the
+# same rules — enough to catch a manifest that would fail to install.
+#
+# Mirrors /usr/share/omarchy/bin/omarchy-plugin-validate.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly MANIFEST="$PLUGIN_DIR/manifest.json"
+
+passed=0
+failed=0
+
+ok()   { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+bad()  { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
+check() { # description, jq filter
+  if jq -e "$2" "$MANIFEST" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi
+}
+
+echo "manifest.json"
+
+if [[ ! -f $MANIFEST ]]; then
+  bad "manifest.json exists"
+  echo; printf '%d passed, %d failed\n' "$passed" "$failed"; exit 1
+fi
+jq -e . "$MANIFEST" >/dev/null 2>&1 && ok "is valid JSON" || bad "is valid JSON"
+
+# schemaVersion must be the JSON number 1: jq's == is type-aware, so the string
+# "1" is rejected here exactly as the registry's `schemaVersion !== 1` rejects it.
+check "declares schemaVersion 1 as a number" '.schemaVersion == 1'
+
+for field in id name version kinds entryPoints; do
+  check "has required field '$field'" "has(\"$field\")"
+done
+
+check "id is non-empty and well formed" \
+  '(.id | type) == "string" and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))'
+check "id does not traverse directories" '(.id | contains("..") | not)'
+check "id avoids the reserved omarchy.* namespace" \
+  '(.id | startswith("omarchy.") | not)'
+
+check "kinds is a non-empty array" '(.kinds | type) == "array" and (.kinds | length) > 0'
+check "entryPoints is an object" '(.entryPoints | type) == "object"'
+
+# Every kind that needs something to load must name it.
+declare -A required_entry=(
+  [bar]=bar [bar-widget]=barWidget [menu]=menu
+  [overlay]=overlay [panel]=panel [service]=service
+)
+for kind in "${!required_entry[@]}"; do
+  entry=${required_entry[$kind]}
+  if jq -e --arg k "$kind" '(.kinds | index($k)) != null' "$MANIFEST" >/dev/null 2>&1; then
+    check "kind '$kind' names entryPoints.$entry" "(.entryPoints | has(\"$entry\"))"
+  fi
+done
+
+# Entry points must be safe relative paths that exist.
+while IFS= read -r entry; do
+  [[ -n $entry ]] || continue
+  if [[ $entry == /* ]]; then
+    bad "entry point '$entry' is relative"
+  elif [[ $entry == *".."* ]]; then
+    bad "entry point '$entry' does not traverse directories"
+  elif [[ ! -f "$PLUGIN_DIR/$entry" ]]; then
+    bad "entry point '$entry' exists"
+  else
+    ok "entry point '$entry' exists and is safe"
+  fi
+done < <(jq -r '.entryPoints | to_entries[] | .value' "$MANIFEST" 2>/dev/null)
+
+if jq -e '(.barWidget? | type) == "object" and (.barWidget | has("defaultSection"))' \
+     "$MANIFEST" >/dev/null 2>&1; then
+  check "barWidget.defaultSection is left, center or right" \
+    '.barWidget.defaultSection as $s | ["left","center","right"] | index($s) != null'
+fi
+
+# Symlinks anywhere inside a plugin folder are refused: once copied into the
+# trusted plugins directory they could point at arbitrary files.
+link=$(find "$PLUGIN_DIR" -name .git -prune -o -type l -print -quit 2>/dev/null)
+if [[ -z $link ]]; then ok "contains no symlinks"; else bad "contains no symlinks: $link"; fi
+
+# Settings the shell renders must each carry a default, or the panel shows blanks.
+if jq -e '(.barWidget.schema? | type) == "array"' "$MANIFEST" >/dev/null 2>&1; then
+  check "every schema entry has a key and a type" \
+    '.barWidget.schema | all(has("key") and has("type"))'
+  check "every schema key has a matching default" \
+    '. as $m | .barWidget.schema | all(.key as $k | $m.barWidget.defaults | has($k))'
+fi
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))

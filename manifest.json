@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "hegjon.passwordstore",
+  "name": "Password Store",
+  "version": "0.1.0",
+  "author": "Jonny Heggheim",
+  "license": "MIT",
+  "description": "pass, the standard unix password manager, as an Omarchy launcher: press a key, type to search your store, then copy or type a password, username or OTP code. Decryption and clipboard clearing are left to pass itself.",
+  "homepage": "https://github.com/hegjon/omarchy-passwordstore",
+  "repository": "https://github.com/hegjon/omarchy-passwordstore",
+  "keywords": [
+    "pass",
+    "passwordstore",
+    "password-store",
+    "password",
+    "passwords",
+    "gpg",
+    "otp",
+    "clipboard"
+  ],
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "overlay": "PasswordstoreOverlay.qml",
+    "barWidget": "PasswordstoreWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Password Store",
+    "description": "Bar button for the Password Store search overlay; holds its settings",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "storeDir": "",
+      "clipTimeSec": 45,
+      "usernameKeys": "login,user,username,email",
+      "allowTyping": true,
+      "notifyOnCopy": true
+    },
+    "schema": [
+      {
+        "key": "storeDir",
+        "type": "string",
+        "label": "Password store directory",
+        "description": "Leave empty to use $PASSWORD_STORE_DIR or ~/.password-store, exactly as pass does.",
+        "defaultValue": ""
+      },
+      {
+        "key": "clipTimeSec",
+        "type": "integer",
+        "label": "Clear the clipboard after (seconds)",
+        "description": "Passed to pass as PASSWORD_STORE_CLIP_TIME. pass's own default is 45.",
+        "min": 5,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 45
+      },
+      {
+        "key": "usernameKeys",
+        "type": "string",
+        "label": "Username field names",
+        "description": "Comma-separated keys, matched case-insensitively against the 'key: value' lines of an entry. Falls back to the second line of the entry.",
+        "defaultValue": "login,user,username,email"
+      },
+      {
+        "key": "allowTyping",
+        "type": "boolean",
+        "label": "Allow typing into the focused window (Ctrl+Enter)",
+        "description": "Ctrl+Enter types the password, Ctrl+Shift+Enter the username, using wtype. Off, only the clipboard actions remain.",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyOnCopy",
+        "type": "boolean",
+        "label": "Show a notification when something is copied",
+        "defaultValue": true
+      }
+    ]
+  },
+  "keepLoaded": true
+}

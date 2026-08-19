@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# Exercise passwordstore-action against stand-ins for pass, wl-copy, wtype and
+# notify-send, so the tests never touch a real store, gpg-agent or clipboard.
+# Each stand-in records what it was asked to do under $work.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly ACTION="$PLUGIN_DIR/passwordstore-action"
+
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/bin"
+export WORK="$work"
+
+# pass: `show NAME` prints a fixture, `otp -c NAME` records the call, `-c` on
+# show records the line asked for. Anything for "missing" fails like pass does.
+cat > "$work/bin/pass" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/pass.calls"
+printf '%s\n' "${PASSWORD_STORE_DIR:-}" > "$WORK/pass.store"
+case "$*" in
+  *missing*) echo "Error: missing is not in the password store." >&2; exit 1 ;;
+esac
+case $1 in
+  show)
+    case "$2" in
+      -c*) echo "copied" ; exit 0 ;;
+    esac
+    printf 'hunter2\nlogin: alice@example.com\nurl: https://example.com\n' ;;
+  otp) exit 0 ;;
+  *) exit 1 ;;
+esac
+SHIM
+
+cat > "$work/bin/wl-copy" <<'SHIM'
+#!/bin/bash
+[[ ${1:-} == --clear ]] && { touch "$WORK/cleared"; exit 0; }
+cat > "$WORK/clipboard"
+SHIM
+cat > "$work/bin/wl-paste" <<'SHIM'
+#!/bin/bash
+cat "$WORK/clipboard" 2>/dev/null
+SHIM
+cat > "$work/bin/wtype" <<'SHIM'
+#!/bin/bash
+cat > "$WORK/typed"
+SHIM
+cat > "$work/bin/notify-send" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/notify.calls"
+SHIM
+chmod +x "$work/bin/"*
+export PATH="$work/bin:$PATH"
+
+passed=0
+failed=0
+ok()  { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+bad() { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
+reset() { rm -f "$work"/{pass.calls,clipboard,cleared,typed,notify.calls,recent}; }
+
+echo "passwordstore-action"
+
+reset
+"$ACTION" copy-password web/site --recent "$work/recent" --clip-time 7 >/dev/null 2>&1
+[[ $? -eq 0 ]] && ok "copy-password exits 0" || bad "copy-password exits 0"
+grep -qx 'show -c web/site' "$work/pass.calls" && ok "copy-password delegates to pass show -c" \
+  || bad "copy-password delegates to pass show -c"
+grep -q 'clears in 7 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
+  || bad "copy-password notifies with the clip time"
+[[ $(cat "$work/recent") == "web/site" ]] && ok "copy-password records the entry as recent" \
+  || bad "copy-password records the entry as recent"
+
+reset
+"$ACTION" copy-username web/site --clip-time 1 >/dev/null 2>&1
+[[ $(cat "$work/clipboard" 2>/dev/null) == "alice@example.com" ]] \
+  && ok "copy-username copies the login: value alone" \
+  || bad "copy-username copies the login: value alone"
+sleep 1.5
+[[ -e $work/cleared ]] && ok "copy-username clears the clipboard after the clip time" \
+  || bad "copy-username clears the clipboard after the clip time"
+
+reset
+"$ACTION" copy-username web/site --username-keys email --clip-time 1 >/dev/null 2>&1
+[[ $? -ne 0 && ! -e $work/clipboard ]] \
+  && ok "copy-username fails when no username key matches and line 2 is key: value" \
+  || bad "copy-username fails when no username key matches and line 2 is key: value"
+grep -q 'No username field' "$work/notify.calls" && ok "… and says so in a notification" \
+  || bad "… and says so in a notification"
+
+reset
+"$ACTION" type-password web/site --quiet >/dev/null 2>&1
+[[ $(cat "$work/typed" 2>/dev/null) == "hunter2" ]] && ok "type-password types the first line, no newline" \
+  || bad "type-password types the first line, no newline"
+[[ ! -e $work/notify.calls ]] && ok "--quiet suppresses the success notification" \
+  || bad "--quiet suppresses the success notification"
+
+reset
+"$ACTION" type-username web/site >/dev/null 2>&1
+[[ $(cat "$work/typed" 2>/dev/null) == "alice@example.com" ]] && ok "type-username types the username" \
+  || bad "type-username types the username"
+
+reset
+"$ACTION" copy-otp web/site >/dev/null 2>&1
+grep -qx 'otp -c web/site' "$work/pass.calls" && ok "copy-otp delegates to pass otp -c" \
+  || bad "copy-otp delegates to pass otp -c"
+
+reset
+"$ACTION" copy-password missing --quiet >/dev/null 2>&1
+[[ $? -eq 1 ]] && ok "a pass failure exits 1" || bad "a pass failure exits 1"
+grep -q 'not in the password store' "$work/notify.calls" && ok "a pass failure is notified even with --quiet" \
+  || bad "a pass failure is notified even with --quiet"
+
+reset
+"$ACTION" copy-password ../etc/passwd >/dev/null 2>&1
+[[ $? -eq 2 && ! -e $work/pass.calls ]] && ok "traversal in the entry name is refused before pass runs" \
+  || bad "traversal in the entry name is refused before pass runs"
+
+reset
+# shellcheck disable=SC2088  # the literal tilde is the point: the script expands it
+HOME=/home/t "$ACTION" copy-password x --store "~/custom/" --quiet >/dev/null 2>&1
+[[ $(cat "$work/pass.store") == "/home/t/custom" ]] && ok "--store expands ~ and strips the trailing slash into PASSWORD_STORE_DIR" \
+  || bad "--store expands ~ and strips the trailing slash into PASSWORD_STORE_DIR"
+
+reset
+"$ACTION" copy-password x --quiet >/dev/null 2>&1
+[[ -z $(cat "$work/pass.store") ]] && ok "without --store pass resolves the store itself" \
+  || bad "without --store pass resolves the store itself"
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))

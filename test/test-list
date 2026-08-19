@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# Exercise passwordstore-list against a throwaway store of empty *.gpg files.
+# Nothing is decrypted, so no gpg setup is needed.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly LIST="$PLUGIN_DIR/passwordstore-list"
+
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+store="$work/store"
+mkdir -p "$store/web" "$store/work/vpn" "$store/.git" "$store/.extensions"
+for n in web/github.com web/gitlab.com work/vpn/office email bank; do
+  mkdir -p "$store/$(dirname "$n")"; : > "$store/$n.gpg"
+done
+: > "$store/.git/ignored.gpg"
+: > "$store/.gpg-id"
+: > "$store/README"
+printf 'bank\nweb/github.com\nbank\ngone\n' > "$work/recent"
+
+# A `pass` must be on PATH for the listing to proceed; a no-op is enough.
+mkdir -p "$work/bin"; printf '#!/bin/bash\n' > "$work/bin/pass"; chmod +x "$work/bin/pass"
+export PATH="$work/bin:$PATH"
+
+passed=0
+failed=0
+ok()  { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+bad() { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
+check() { # description, jq filter, json
+  if jq -e "$2" <<<"$3" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi
+}
+
+echo "passwordstore-list"
+
+out=$("$LIST" --store "$store" --recent "$work/recent")
+check "output is JSON" '.' "$out"
+check "counts the five entries" '.count == 5 and (.entries | length) == 5' "$out"
+check "names are store-relative without .gpg" '.entries | index("web/github.com") != null' "$out"
+check "entries are sorted" '.entries == (.entries | sort)' "$out"
+check "skips .git" '.entries | index(".git/ignored") == null' "$out"
+check "skips non-.gpg files" '.entries | index("README") == null' "$out"
+check "recent is most-recent-first and deduplicated" '.recent == ["bank", "web/github.com"]' "$out"
+check "recent drops names no longer in the store" '.recent | index("gone") == null' "$out"
+check "otp is false without the extension" '.otp == false' "$out"
+[[ $(jq -r .store <<<"$out") == "$store" ]] && ok "reports the resolved store path" || bad "reports the resolved store path"
+
+: > "$store/.extensions/otp.bash"
+out=$("$LIST" --store "$store")
+check "otp is true with .extensions/otp.bash" '.otp == true' "$out"
+check "no --recent gives an empty recent list" '.recent == []' "$out"
+
+out=$(PASSWORD_STORE_DIR="$store" "$LIST")
+check "honours PASSWORD_STORE_DIR when --store is absent" '.count == 5' "$out"
+
+out=$("$LIST" --store "$work/nowhere")
+check "a missing store is reported as an error, exit 0" '.error | test("No password store")' "$out"
+
+# A PATH with jq but no pass.
+mkdir -p "$work/nopass"; ln -s "$(command -v jq)" "$work/nopass/jq"
+out=$(PATH="$work/nopass" /bin/bash "$LIST" --store "$store")
+check "a missing pass is reported as an error" '.error | test("pass is not installed")' "$out"
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))
