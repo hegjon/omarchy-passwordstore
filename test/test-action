@@ -124,6 +124,11 @@ grep -q 'not in the password store' "$work/notify.calls" && ok "a pass failure i
   || bad "a pass failure is notified even with --quiet"
 
 reset
+"$ACTION" copy-password 'x/<b>bold</b> & co' --clip-time 1 >/dev/null 2>&1
+grep -q 'x/&lt;b&gt;bold&lt;/b&gt; &amp; co' "$work/notify.calls" && ok "markup in an entry name is escaped in the notification" \
+  || bad "markup in an entry name is escaped in the notification"
+
+reset
 "$ACTION" copy-password ../etc/passwd >/dev/null 2>&1
 [[ $? -eq 2 && ! -e $work/pass.calls ]] && ok "traversal in the entry name is refused before pass runs" \
   || bad "traversal in the entry name is refused before pass runs"

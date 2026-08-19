@@ -379,6 +379,11 @@ Item {
 
   // --- the card ---------------------------------------------------------
 
+  // Every Text that can show an entry name, the query or helper output is
+  // PlainText. Qt's default AutoText sniffs for HTML, and a store entry named
+  // like <img src="…"> (a synced store is not necessarily one's own doing)
+  // would otherwise be rendered as rich text and fetch what it points at.
+
   readonly property string hintText: {
     var hints = ["Enter copy password", "Alt+U username"]
     if (otpAvailable) hints.push("Alt+O OTP")
@@ -495,6 +500,7 @@ Item {
             anchors.rightMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
             text: root.filterText || "Password…"
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -569,6 +575,7 @@ Item {
                 Text {
                   width: parent.width
                   text: row.modelData.leaf
+                  textFormat: Text.PlainText
                   color: row.hasCursor ? root.selectedText : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.heading
@@ -580,6 +587,7 @@ Item {
                   width: parent.width
                   visible: row.modelData.folder !== ""
                   text: row.modelData.folder
+                  textFormat: Text.PlainText
                   color: row.hasCursor ? root.selectedText : root.foreground
                   opacity: 0.52
                   font.family: root.fontFamily
@@ -642,6 +650,7 @@ Item {
               width: parent.width
               wrapMode: Text.WordWrap
               horizontalAlignment: Text.AlignHCenter
+              textFormat: Text.PlainText
               text: root.lastError !== ""
                 ? root.lastError
                 : (!root.initialized
