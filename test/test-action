@@ -29,7 +29,9 @@ esac
 case $1 in
   show)
     case "$2" in
-      -c*) echo "copied" ; exit 0 ;;
+      # Like the real pass, leave a background sleeper that inherits stdout
+      # and stderr: the action must not wait for it.
+      -c*) echo "copied"; (sleep 4) & exit 0 ;;
     esac
     printf 'hunter2\nlogin: alice@example.com\nurl: https://example.com\n' ;;
   otp) exit 0 ;;
@@ -66,8 +68,11 @@ reset() { rm -f "$work"/{pass.calls,clipboard,cleared,typed,notify.calls,recent}
 echo "passwordstore-action"
 
 reset
+start=$SECONDS
 "$ACTION" copy-password web/site --recent "$work/recent" --clip-time 7 >/dev/null 2>&1
 [[ $? -eq 0 ]] && ok "copy-password exits 0" || bad "copy-password exits 0"
+[[ $(( SECONDS - start )) -lt 3 ]] && ok "copy-password returns without waiting for pass's clipboard sleeper" \
+  || bad "copy-password returns without waiting for pass's clipboard sleeper"
 grep -qx 'show -c web/site' "$work/pass.calls" && ok "copy-password delegates to pass show -c" \
   || bad "copy-password delegates to pass show -c"
 grep -q 'clears in 7 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
