@@ -43,6 +43,23 @@ o.bind("SUPER + P", "Password store", "omarchy-shell shell toggle hegjon.passwor
 `omarchy bar put` is still needed even if you only ever use the keybinding:
 the bar entry is where the settings live.
 
+## Uninstall
+
+```bash
+omarchy plugin remove hegjon.passwordstore
+```
+
+That deletes the plugin folder (the shell notices and drops the bar widget).
+Then remove the two lines you may have added to `~/.config/hypr/bindings.lua`,
+and, if you want no trace left, the recently-used list:
+
+```bash
+rm -rf ~/.local/state/omarchy-passwordstore
+```
+
+Your password store itself is never touched: the plugin only reads it through
+`pass`.
+
 ## Keys
 
 | Key                      | Action                                                   |
