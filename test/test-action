@@ -77,8 +77,9 @@ grep -qx 'show -c web/site' "$work/pass.calls" && ok "copy-password delegates to
   || bad "copy-password delegates to pass show -c"
 grep -q 'clears in 7 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
   || bad "copy-password notifies with the clip time"
-grep -q 'web/site — alice@example.com' "$work/notify.calls" && ok "copy-password names the username in the notification" \
-  || bad "copy-password names the username in the notification"
+grep -qzP 'web/site\nalice@example.com\nClipboard clears in 7 s' "$work/notify.calls" \
+  && ok "copy-password lists entry, username and clip time on separate lines" \
+  || bad "copy-password lists entry, username and clip time on separate lines"
 [[ $(cat "$work/recent") == "web/site" ]] && ok "copy-password records the entry as recent" \
   || bad "copy-password records the entry as recent"
 
