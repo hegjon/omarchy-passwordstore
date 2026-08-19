@@ -20,13 +20,27 @@ the [Omarchy](https://omarchy.org/) bar.
 ## Install
 
 ```bash
-git clone https://github.com/hegjon/omarchy-passwordstore \
-  ~/.config/omarchy/plugins/hegjon.passwordstore
-omarchy bar put hegjon.passwordstore
+omarchy plugin add https://github.com/hegjon/omarchy-passwordstore.git --enable
+omarchy restart shell
 ```
 
-The shell picks up the new plugin without a restart. If it does not, run
-`omarchy restart shell`.
+If the bar widget is enabled but not visible, place it explicitly:
+
+```bash
+omarchy plugin enable hegjon.passwordstore --section right
+omarchy restart shell
+```
+
+Update or remove:
+
+```bash
+omarchy plugin update hegjon.passwordstore --yes
+omarchy plugin remove hegjon.passwordstore
+```
+
+Removing the plugin leaves your password store untouched (it is only ever read
+through `pass`). If you want no trace left, also delete the recently-used list,
+`~/.local/state/omarchy-passwordstore/`, and any keybinding you added below.
 
 Needs `pass` (`omarchy pkg add pass`), `wl-clipboard` and `jq` (both part of
 Omarchy), and `wtype` for the typing actions. `pass-otp` is optional; the OTP
@@ -40,25 +54,8 @@ hl.unbind("SUPER + P")
 o.bind("SUPER + P", "Password store", "omarchy-shell shell toggle hegjon.passwordstore")
 ```
 
-`omarchy bar put` is still needed even if you only ever use the keybinding:
-the bar entry is where the settings live.
-
-## Uninstall
-
-```bash
-omarchy plugin remove hegjon.passwordstore
-```
-
-That deletes the plugin folder (the shell notices and drops the bar widget).
-Then remove the two lines you may have added to `~/.config/hypr/bindings.lua`,
-and, if you want no trace left, the recently-used list:
-
-```bash
-rm -rf ~/.local/state/omarchy-passwordstore
-```
-
-Your password store itself is never touched: the plugin only reads it through
-`pass`.
+The bar widget is still needed even if you only ever use the keybinding: its
+bar entry is where the settings live.
 
 ## Keys
 
