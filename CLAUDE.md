@@ -6,7 +6,7 @@ Omarchy overlay + bar-widget plugin. This checkout *is* the installed plugin
 ## Verifying changes
 
 - `test/lint` (qmllint), `test/test-manifest`, `test/test-list`,
-  `test/test-action`, `omarchy-plugin-validate .` and
+  `test/test-action`, `test/test-pinentry`, `omarchy-plugin-validate .` and
   `shellcheck --severity=warning passwordstore-* test/test-*`.
 - The shell hot-reloads on file change, but a QML *type* error (a bad
   component file) is cached until `omarchy-restart-shell`. Wait ~8 s after a
@@ -30,6 +30,18 @@ Omarchy overlay + bar-widget plugin. This checkout *is* the installed plugin
 - A real end-to-end copy: `./passwordstore-action copy-password <entry>
   --clip-time 5`. It decrypts, so gpg-agent may raise pinentry; run it under
   `timeout` when nobody is at the screen.
+
+- `pinentry-omarchy` can be tried without touching the real agent: a
+  throwaway `GNUPGHOME` with `pinentry-program <path>` in its
+  `gpg-agent.conf`, a key made with `--pinentry-mode loopback --passphrase`,
+  then `gpg --decrypt` of something encrypted to it raises the card
+  (`omarchy-pinentry` layer). `test/test-pinentry` drives the protocol with a
+  stand-in prompt (`PINENTRY_OMARCHY_PROMPT`).
+- The prompt's Quickshell config root is staged under
+  `$XDG_RUNTIME_DIR/pinentry-omarchy/` with symlinks to the shell's
+  `Commons`/`Ui`, because a plugin folder may not contain symlinks
+  (`omarchy-plugin-validate` refuses them) and `qs.*` imports resolve from
+  the config root.
 
 ## Things that bit before
 

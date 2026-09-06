@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Drive pinentry-omarchy through the Assuan protocol with a stand-in for the
+# Quickshell prompt (PINENTRY_OMARCHY_PROMPT), which answers over the socket
+# with whatever $WORK/answer.json holds and records the request it was given.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly PINENTRY="$PLUGIN_DIR/pinentry-omarchy"
+
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+export WORK="$work"
+export XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$work/run"
+
+cat > "$work/prompt" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$PINENTRY_OMARCHY_REQUEST" > "$WORK/request.json"
+[[ -e $WORK/answer.json ]] || exit 0            # no answer: the prompt just quits
+python3 - <<'PY'
+import os, socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["PINENTRY_OMARCHY_SOCKET"])
+s.sendall(open(os.path.join(os.environ["WORK"], "answer.json"), "rb").read())
+s.close()
+PY
+SHIM
+chmod +x "$work/prompt"
+export PINENTRY_OMARCHY_PROMPT="$work/prompt"
+
+passed=0
+failed=0
+ok()  { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+bad() { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
+reset() { rm -f "$work/request.json" "$work/answer.json"; }
+talk() { printf '%b' "$1" | "$PINENTRY" 2>/dev/null; }
+
+echo "pinentry-omarchy"
+
+out=$(talk 'BYE\n')
+[[ $(sed -n 1p <<<"$out") == "OK Pleased to meet you" && $(sed -n 2p <<<"$out") == "OK closing connection" ]] \
+  && ok "greets and says goodbye" || bad "greets and says goodbye"
+
+out=$(talk 'OPTION grab\nOPTION ttyname=/dev/pts/0\nOPTION default-ok=_OK\nGETINFO flavor\nGETINFO version\nGETINFO pid\nGETINFO ttyinfo\nBYE\n')
+[[ $(grep -c '^OK$' <<<"$out") -eq 7 ]] && ok "OPTION and GETINFO answer OK" || bad "OPTION and GETINFO answer OK"
+grep -qx 'D omarchy' <<<"$out" && ok "GETINFO flavor is omarchy" || bad "GETINFO flavor is omarchy"
+grep -q '^D [0-9]\+$' <<<"$out" && ok "GETINFO pid gives a number" || bad "GETINFO pid gives a number"
+
+reset
+printf '{"ok": true, "pin": "s3cret %%\\nline"}' > "$work/answer.json"
+out=$(talk 'SETDESC Please enter the passphrase%0Afor "Jack" <j@x>\nSETPROMPT Passphrase:\nSETKEYINFO n/ABCDEF\nSETOK _Unlock\nSETCANCEL _Cancel\nSETERROR Bad Passphrase (try 2 of 3)\nGETPIN\nBYE\n')
+grep -qx 'D s3cret %25%0Aline' <<<"$out" && ok "GETPIN returns the pin percent-escaped" || bad "GETPIN returns the pin percent-escaped"
+[[ $(grep -A1 '^D s3cret' <<<"$out" | sed -n 2p) == OK ]] && ok "…followed by OK" || bad "…followed by OK"
+req=$(cat "$work/request.json")
+[[ $(jq -r .mode <<<"$req") == getpin ]] && ok "the prompt is asked for a pin" || bad "the prompt is asked for a pin"
+[[ $(jq -r .description <<<"$req") == $'Please enter the passphrase\nfor "Jack" <j@x>' ]] \
+  && ok "SETDESC is percent-decoded, newlines included" || bad "SETDESC is percent-decoded, newlines included"
+[[ $(jq -r .ok <<<"$req") == Unlock && $(jq -r .cancel <<<"$req") == Cancel ]] \
+  && ok "SETOK / SETCANCEL labels lose their _ mnemonic" || bad "SETOK / SETCANCEL labels lose their _ mnemonic"
+[[ $(jq -r .error <<<"$req") == 'Bad Passphrase (try 2 of 3)' ]] && ok "SETERROR reaches the prompt" || bad "SETERROR reaches the prompt"
+grep -q 'pin' "$work/request.json" && grep -q 's3cret' "$work/request.json" && bad "the pin never appears in the request" || ok "the pin never appears in the request"
+
+reset
+printf '{"ok": false}' > "$work/answer.json"
+out=$(talk 'GETPIN\nBYE\n')
+grep -q '^ERR 83886179 Operation cancelled' <<<"$out" && ok "a cancelled prompt is ERR 83886179" || bad "a cancelled prompt is ERR 83886179"
+grep -q '^D ' <<<"$out" && bad "…and no D line" || ok "…and no D line"
+
+reset
+out=$(talk 'GETPIN\nBYE\n')
+grep -q '^ERR 83886179' <<<"$out" && ok "a prompt that quits without answering is a cancel" || bad "a prompt that quits without answering is a cancel"
+grep -qx 'OK closing connection' <<<"$out" && ok "…and the session goes on to BYE" || bad "…and the session goes on to BYE"
+
+reset
+printf '{"ok": true, "pin": "twice"}' > "$work/answer.json"
+out=$(talk 'SETREPEAT Repeat:\nGETPIN\nBYE\n')
+[[ $(grep -n 'S PIN_REPEATED\|^D twice' <<<"$out" | cut -d: -f2 | tr '\n' ' ') == "S PIN_REPEATED D twice " ]] \
+  && ok "SETREPEAT: S PIN_REPEATED comes before the pin" || bad "SETREPEAT: S PIN_REPEATED comes before the pin"
+[[ $(jq -r .repeat <<<"$(cat "$work/request.json")") == "Repeat:" ]] && ok "the prompt is told to ask twice" || bad "the prompt is told to ask twice"
+
+reset
+printf '{"ok": true}' > "$work/answer.json"
+out=$(talk 'SETDESC Really?\nCONFIRM\nBYE\n')
+[[ $(grep -c '^OK$' <<<"$out") -eq 2 && $(jq -r .mode <<<"$(cat "$work/request.json")") == confirm ]] \
+  && ok "CONFIRM answered yes is OK" || bad "CONFIRM answered yes is OK"
+reset
+printf '{"ok": false, "notok": true}' > "$work/answer.json"
+out=$(talk 'CONFIRM\nBYE\n')
+grep -q '^ERR 83886194 Not confirmed' <<<"$out" && ok "CONFIRM answered no is ERR 83886194" || bad "CONFIRM answered no is ERR 83886194"
+reset
+printf '{"ok": true}' > "$work/answer.json"
+out=$(talk 'CONFIRM --one-button\nBYE\n')
+[[ $(jq -r .oneButton <<<"$(cat "$work/request.json")") == true ]] && ok "CONFIRM --one-button is passed on" || bad "CONFIRM --one-button is passed on"
+reset
+printf '{"ok": true}' > "$work/answer.json"
+out=$(talk 'MESSAGE\nBYE\n')
+[[ $(jq -r .mode <<<"$(cat "$work/request.json")") == message ]] && grep -qc '^OK$' <<<"$out" \
+  && ok "MESSAGE shows and answers OK" || bad "MESSAGE shows and answers OK"
+
+out=$(talk 'FROBNICATE\nBYE\n')
+grep -q '^ERR 83886355 Unknown IPC command' <<<"$out" && ok "an unknown command is ERR 83886355" || bad "an unknown command is ERR 83886355"
+
+reset
+printf '{"ok": true, "pin": "x"}' > "$work/answer.json"
+out=$(talk 'SETERROR wrong\nGETPIN\nGETPIN\nBYE\n')
+[[ $(jq -r .error <<<"$(cat "$work/request.json")") == "" ]] && ok "SETERROR is cleared after a GETPIN" || bad "SETERROR is cleared after a GETPIN"
+
+[[ -z $(ls "$work/run") ]] && ok "the socket directory is cleaned up" || bad "the socket directory is cleaned up"
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))

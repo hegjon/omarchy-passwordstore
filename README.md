@@ -57,6 +57,25 @@ o.bind("SUPER + P", "Password store", "omarchy-shell shell toggle hegjon.passwor
 The bar widget is still needed even if you only ever use the keybinding: its
 bar entry is where the settings live.
 
+## The passphrase prompt
+
+gpg-agent asks for a key's passphrase through a *pinentry*; on Omarchy that
+is the GNOME dialog unless told otherwise. `pinentry-omarchy`, shipped here,
+draws the same prompt the way the shell's lock screen and polkit agent do
+(a card with a masked field, the key's name above it, `Alt+R` to show what
+you typed, a second field when gpg wants a new passphrase twice). Point
+gpg-agent at it:
+
+```
+# ~/.gnupg/gpg-agent.conf
+pinentry-program /home/you/.config/omarchy/plugins/hegjon.passwordstore/pinentry-omarchy
+```
+
+then `gpgconf --reload gpg-agent`. It speaks the Assuan pinentry protocol on
+stdin/stdout; the passphrase goes from the card to it over a private unix
+socket in `$XDG_RUNTIME_DIR` and on to gpg-agent, never through argv or a
+file. Needs Quickshell (`qs`), which Omarchy ships, and python3.
+
 ## Keys
 
 | Key                      | Action                                                   |
@@ -116,7 +135,9 @@ Recently used names are kept in `$XDG_STATE_HOME/omarchy-passwordstore/recent`
 
 `test/lint` runs qmllint, `test/test-manifest` checks the manifest,
 `test/test-list` and `test/test-action` exercise the scripts against a
-throwaway store and stand-in `pass`/`wl-copy`/`wtype`, so no gpg key is needed.
+throwaway store and stand-in `pass`/`wl-copy`/`wtype`, so no gpg key is
+needed; `test/test-pinentry` drives `pinentry-omarchy` through the Assuan
+protocol with a stand-in prompt.
 
 ## License
 
