@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""A pinentry for gpg-agent that asks in Omarchy's own style.
+
+gpg-agent talks the Assuan pinentry protocol on stdin/stdout; this program
+answers it and, when a passphrase or a confirmation is needed, shows a card
+drawn by Quickshell with the shell's tokens (pinentry/shell.qml), the way the
+polkit and lock prompts look. The passphrase travels from that card over a
+unix socket in $XDG_RUNTIME_DIR back here, and from here to gpg-agent on
+stdout: never argv, never a file.
+
+Point gpg-agent at it with `pinentry-program /path/to/pinentry-omarchy` in
+~/.gnupg/gpg-agent.conf, then `gpgconf --reload gpg-agent`
+(`passwordstore-setup pinentry --enable` does both).
+
+Test hook: PINENTRY_OMARCHY_PROMPT names a command run in place of
+Quickshell; it receives the same environment and must write the result JSON
+to the socket.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "1.0.0"
+ERR_CANCELLED = 83886179      # GPG_ERR_CANCELED, source pinentry
+ERR_NOT_CONFIRMED = 83886194  # GPG_ERR_NOT_CONFIRMED
+ERR_UNKNOWN_CMD = 83886355    # GPG_ERR_ASS_UNKNOWN_CMD
+ERR_TIMEOUT = 83886142        # GPG_ERR_TIMEOUT
+
+PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
+PROMPT_QML = os.path.join(PLUGIN_DIR, "pinentry", "shell.qml")
+SHELL_DIR = os.path.join(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"), "shell")
+
+
+def stage_config():
+    """A Quickshell config root for the prompt, outside the plugin folder.
+
+    shell.qml imports qs.Commons and qs.Ui, which Quickshell resolves from the
+    config root, so the root needs symlinks to the shell's modules; a plugin
+    folder may not contain symlinks (omarchy-plugin-validate refuses them),
+    hence a staging directory under the runtime dir, refreshed when the
+    plugin's copy changes.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    root = os.path.join(runtime, "pinentry-omarchy")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    target = os.path.join(root, "shell.qml")
+    try:
+        if not os.path.exists(target) or os.path.getmtime(target) < os.path.getmtime(PROMPT_QML):
+            with open(PROMPT_QML, "rb") as src, open(target, "wb") as dst:
+                dst.write(src.read())
+    except OSError:
+        return PROMPT_QML
+    for name in ("Commons", "Ui"):
+        link = os.path.join(root, name)
+        want = os.path.join(SHELL_DIR, name)
+        try:
+            if os.path.islink(link) and os.readlink(link) == want:
+                continue
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(want, link)
+        except OSError:
+            return PROMPT_QML
+    return target
+
+
+def unescape(text):
+    """Assuan %XX escapes, in the arguments the agent sends."""
+    out = bytearray()
+    data = text.encode("utf-8", "surrogateescape")
+    i = 0
+    while i < len(data):
+        if data[i] == 0x25 and i + 2 < len(data):
+            try:
+                out.append(int(data[i + 1:i + 3], 16))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out.append(data[i])
+        i += 1
+    return out.decode("utf-8", "replace")
+
+
+def escape(text):
+    """The same escapes for what goes back in a D line."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def mnemonic(label):
+    """gpg-agent's button labels carry a _ before the accelerator letter."""
+    return label.replace("__", "\x00").replace("_", "").replace("\x00", "_")
+
+
+class Pinentry:
+    def __init__(self):
+        self.reset()
+        self.out = sys.stdout
+
+    def reset(self):
+        self.desc = ""
+        self.prompt = "Passphrase:"
+        self.title = ""
+        self.error = ""
+        self.ok = "OK"
+        self.cancel = "Cancel"
+        self.notok = ""
+        self.repeat = ""
+        self.repeat_error = "Passphrases do not match"
+        self.keyinfo = ""
+        self.timeout = 0
+
+    def send(self, line):
+        self.out.write(line + "\n")
+        self.out.flush()
+
+    # --- the prompt ------------------------------------------------------
+
+    def ask(self, mode, one_button=False):
+        """Show the card; returns the result dict or None when cancelled."""
+        request = {
+            "mode": mode,
+            "title": self.title or "Passphrase",
+            "description": self.desc,
+            "prompt": self.prompt,
+            "error": self.error,
+            "ok": self.ok,
+            "cancel": self.cancel,
+            "notok": self.notok,
+            "repeat": self.repeat,
+            "repeatError": self.repeat_error,
+            "oneButton": one_button,
+        }
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        sockdir = tempfile.mkdtemp(prefix="pinentry-omarchy.", dir=runtime)
+        path = os.path.join(sockdir, "sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(path)
+            os.chmod(path, 0o600)
+            server.listen(1)
+            server.settimeout(0.25)
+            env = dict(os.environ)
+            env["PINENTRY_OMARCHY_SOCKET"] = path
+            env["PINENTRY_OMARCHY_REQUEST"] = json.dumps(request)
+            self.fill_wayland_env(env)
+            hook = env.get("PINENTRY_OMARCHY_PROMPT")
+            command = [hook] if hook else ["qs", "-p", stage_config()]
+            try:
+                proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                return None
+            deadline = time.monotonic() + self.timeout if self.timeout > 0 else None
+            data = b""
+            conn = None
+            while conn is None:
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    if proc.poll() is not None:
+                        return None
+                    if deadline and time.monotonic() > deadline:
+                        proc.terminate()
+                        return {"timeout": True}
+            with conn:
+                conn.settimeout(None)
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            proc.wait(timeout=5) if proc.poll() is None else None
+            try:
+                result = json.loads(data.decode("utf-8"))
+            except ValueError:
+                return None
+            return result if isinstance(result, dict) else None
+        finally:
+            server.close()
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(sockdir)
+            except OSError:
+                pass
+
+    @staticmethod
+    def fill_wayland_env(env):
+        """gpg-agent may have been started without the compositor's display."""
+        if env.get("WAYLAND_DISPLAY"):
+            return
+        runtime = env.get("XDG_RUNTIME_DIR")
+        if not runtime:
+            return
+        try:
+            names = sorted(n for n in os.listdir(runtime) if n.startswith("wayland-") and not n.endswith(".lock"))
+        except OSError:
+            return
+        if names:
+            env["WAYLAND_DISPLAY"] = names[0]
+
+    # --- commands ---------------------------------------------------------
+
+    def getpin(self):
+        result = self.ask("getpin")
+        if result is None or not result.get("ok"):
+            if result and result.get("timeout"):
+                self.send("ERR %d Timeout <Pinentry>" % ERR_TIMEOUT)
+            else:
+                self.send("ERR %d Operation cancelled <Pinentry>" % ERR_CANCELLED)
+            return
+        pin = str(result.get("pin", ""))
+        if self.repeat:
+            self.send("S PIN_REPEATED")
+        self.send("D " + escape(pin))
+        self.send("OK")
+
+    def confirm(self, one_button):
+        result = self.ask("confirm", one_button)
+        if result is None:
+            self.send("ERR %d Operation cancelled <Pinentry>" % ERR_CANCELLED)
+        elif result.get("ok"):
+            self.send("OK")
+        elif result.get("notok"):
+            self.send("ERR %d Not confirmed <Pinentry>" % ERR_NOT_CONFIRMED)
+        else:
+            self.send("ERR %d Operation cancelled <Pinentry>" % ERR_CANCELLED)
+
+    def handle(self, line):
+        line = line.rstrip("\r\n")
+        if not line or line.startswith("#"):
+            return True
+        parts = line.split(" ", 1)
+        cmd = parts[0].upper()
+        arg = unescape(parts[1]) if len(parts) > 1 else ""
+        if cmd == "BYE":
+            self.send("OK closing connection")
+            return False
+        if cmd == "OPTION":
+            name, _, value = arg.partition("=")
+            if name == "default-ok":
+                self.ok = mnemonic(value)
+            elif name == "default-cancel":
+                self.cancel = mnemonic(value)
+            elif name == "default-prompt":
+                self.prompt = value
+            self.send("OK")
+        elif cmd == "GETINFO":
+            what = arg.strip()
+            if what == "flavor":
+                self.send("D omarchy")
+            elif what == "version":
+                self.send("D " + VERSION)
+            elif what == "pid":
+                self.send("D %d" % os.getpid())
+            elif what == "ttyinfo":
+                self.send("D - - -")
+            self.send("OK")
+        elif cmd == "SETDESC":
+            self.desc = arg; self.send("OK")
+        elif cmd == "SETPROMPT":
+            self.prompt = mnemonic(arg); self.send("OK")
+        elif cmd == "SETTITLE":
+            self.title = arg; self.send("OK")
+        elif cmd == "SETERROR":
+            self.error = arg; self.send("OK")
+        elif cmd == "SETOK":
+            self.ok = mnemonic(arg); self.send("OK")
+        elif cmd == "SETCANCEL":
+            self.cancel = mnemonic(arg); self.send("OK")
+        elif cmd == "SETNOTOK":
+            self.notok = mnemonic(arg); self.send("OK")
+        elif cmd == "SETREPEAT":
+            self.repeat = mnemonic(arg) or "Repeat:"; self.send("OK")
+        elif cmd == "SETREPEATERROR":
+            self.repeat_error = arg; self.send("OK")
+        elif cmd == "SETKEYINFO":
+            self.keyinfo = arg; self.send("OK")
+        elif cmd == "SETTIMEOUT":
+            try:
+                self.timeout = int(arg)
+            except ValueError:
+                self.timeout = 0
+            self.send("OK")
+        elif cmd in ("SETQUALITYBAR", "SETQUALITYBAR_TT", "SETGENPIN", "SETGENPIN_TT",
+                     "SETFORMATTEDPASSPHRASE", "SETFORMATTEDPASSPHRASE_TT", "SETCONSTRAINTS", "SETCONSTRAINTS_TT",
+                     "SETCAPSLOCK_TT", "SETCF_ACTION_FN", "CLEARPASSPHRASE", "HELP", "NOP", "END", "CANCEL"):
+            self.send("OK")
+        elif cmd == "RESET":
+            self.reset(); self.send("OK")
+        elif cmd == "GETPIN":
+            self.getpin()
+            # gpg-agent sets the error and prompt afresh for every try.
+            self.error = ""
+            self.repeat = ""
+        elif cmd == "CONFIRM":
+            self.confirm("--one-button" in arg)
+        elif cmd == "MESSAGE":
+            self.ask("message", True)
+            self.send("OK")
+        else:
+            self.send("ERR %d Unknown IPC command <Pinentry>" % ERR_UNKNOWN_CMD)
+        return True
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-v"):
+        print("pinentry-omarchy " + VERSION)
+        return 0
+    entry = Pinentry()
+    entry.send("OK Pleased to meet you")
+    for line in sys.stdin:
+        if not entry.handle(line):
+            break
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
