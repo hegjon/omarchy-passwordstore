@@ -39,17 +39,47 @@ Omarchy overlay + bar-widget plugin. This checkout *is* the installed plugin
   (`IpcHandler::updateRegistration` during `onPostReload`) when a plugin
   hot-reload raced an `omarchy-restart-shell`. No first-party overlay has one;
   neither does this plugin now. Save files, *then* wait, *then* restart.
-- `pass show -cN` copies the *whole* line N, `login: alice` included, which is
-  why the username path reads the entry and copies the value itself (with the
-  same clear-after-N-seconds behaviour). Password and OTP still go through
-  `pass -c` so pass's own clipboard handling is kept.
-- The card is type-to-filter with no TextField (the menu's pattern), so
-  single letters are never shortcuts; actions are Enter plus modifiers. `Util.editsFilter` claims Ctrl+U (clear) and Backspace.
+- `pass -c` copies with a plain `wl-copy`, which Omarchy's clipboard history
+  records. Every copy is therefore done by the helper: `wl-copy --sensitive`
+  (the x-kde-passwordManagerHint type, which
+  `/usr/share/omarchy/shell/plugins/clipboard/capture.sh` refuses), a
+  sleeper that clears the clipboard after `clipTimeSec`, and a purge of
+  `~/.local/state/omarchy/clipboard-history.json` (the shell watches that
+  file) in case an older wl-copy let the value in. `pass show -cN` would
+  also have copied the whole `login: alice` line.
+- The clipboard sleeper is named (`exec -a "passwordstore clip sleep"` around
+  `sleep & wait`, because bash execs a lone command and loses the name) so
+  the next copy can `pkill` it and restart the timer, as pass does.
+- The search card is type-to-filter with no TextField (the menu's pattern),
+  so single letters are never shortcuts there; actions are Enter plus
+  modifiers. `Util.editsFilter` claims Ctrl+U (clear) and Backspace. The
+  editor has fields and `Ctrl`/`Alt` keys: `keyCatcher` ignores keys outside
+  search mode so they bubble to the card's `Keys.onPressed`, after the
+  focused field has had its turn (`EditField` and the notes area also run
+  `editKey` first, so Esc and Ctrl+Enter work from inside a field).
+- The editor is the one place a password is in QML (the masked field, like
+  the lock screen's). It reaches `passwordstore-action save` over the
+  Process's stdin, written from `onStarted` (a write before `started` is
+  dropped) and closed by setting `stdinEnabled = false`; `read` output is
+  gathered through a `SplitParser` with an empty marker and the buffer
+  cleared after parsing, because a `StdioCollector` keeps its text until the
+  next run. `resetEditor()` wipes every field whenever the card leaves the
+  editor, including on dismiss; setting `text = ""` also drops the field's
+  undo stack (`clear()` does not).
+- Entries are `name/username` paths; `splitName` takes the last segment as
+  the username. The file format `save` writes and `read` parses is in the
+  helper's header comment; unknown `key: value` lines and `otpauth://` lines
+  round-trip through `extra`. A classic `web/github.com` with a `login:`
+  inside is handled on read: the decrypted username wins, the whole path
+  becomes the name, and saving without edits keeps the path (an edit moves
+  it to name/username). `--no-overwrite` guards a new name against an
+  existing entry, since `pass insert -f` / `pass mv -f` would clobber it.
 - `--quiet` only suppresses the success notifications; failures always notify,
   because the popup is gone by the time the script runs.
 
 ## Style
 
-- Comments explain *why*. Secrets never go through argv, `console.log`, or a
-  QML property; keep it that way.
+- Comments explain *why*. Secrets never go through argv, `console.log`,
+  notifications or files outside the store; the only QML that holds one is
+  the editor's password field, wiped on leave. Keep it that way.
 - Version lives in `manifest.json`.
