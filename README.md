@@ -14,8 +14,9 @@ the [Omarchy](https://omarchy.org/) bar.
   `Alt+E` opens the entry in a terminal with `pass edit`.
 - Recently used entries float to the top of an empty search.
 - Nothing is decrypted by the widget. Every action is handed to `pass` itself,
-  so gpg-agent prompts as it would from a terminal and the clipboard is
-  cleared after 45 s exactly as `pass -c` does.
+  so gpg-agent prompts as it would from a terminal. What is copied carries
+  the password-manager hint, so Omarchy's clipboard history never records
+  it, and the clipboard is cleared again after 60 s (`clipTimeSec`).
 
 ## Install
 
@@ -63,9 +64,9 @@ bar entry is where the settings live.
 |--------------------------|----------------------------------------------------------|
 | any printable            | Extend the search. `Backspace`, `Ctrl+Backspace`, `Ctrl+U` edit it |
 | `↑` `↓` `Ctrl+J/K/N/P`   | Move the cursor; `PageUp/Down`, `Home`, `End` jump       |
-| `Enter`                  | Copy the password (`pass show -c`)                       |
+| `Enter`                  | Copy the password; the clipboard clears after `clipTimeSec` and the history never sees it |
 | `Alt+U` / `Alt+Enter`    | Copy the username                                        |
-| `Alt+O`                  | Copy an OTP code (`pass otp -c`)                         |
+| `Alt+O`                  | Copy an OTP code (`pass otp`)                            |
 | `Ctrl+Enter`             | Type the password into the focused window                |
 | `Ctrl+Shift+Enter`       | Type the username                                        |
 | `Alt+E`                  | `pass edit` in a terminal                                |
@@ -90,7 +91,7 @@ omarchy bar set hegjon.passwordstore allowTyping false --json
 | Key              | Default                      | Meaning                                                                 |
 |------------------|------------------------------|-------------------------------------------------------------------------|
 | `storeDir`       | *(empty)*                    | Store location. Empty means `$PASSWORD_STORE_DIR` or `~/.password-store`, as pass does. |
-| `clipTimeSec`    | `45`                         | Seconds until the clipboard is cleared (`PASSWORD_STORE_CLIP_TIME`).   |
+| `clipTimeSec`    | `60`                         | Seconds until a copied password, username or OTP code is cleared from the clipboard. The value is copied with the password-manager hint, so the clipboard history never records it; should an older `wl-copy` have let it in, it is removed from the history file at the same moment. Also `PASSWORD_STORE_CLIP_TIME` for `pass edit`. |
 | `usernameKeys`   | `login,user,username,email`  | Field names that hold the username, matched case-insensitively.        |
 | `allowTyping`    | `true`                       | Enable `Ctrl+Enter` / `Ctrl+Shift+Enter` (needs `wtype`).               |
 | `notifyOnCopy`   | `true`                       | Notify when something was copied, naming the entry and its username. Failures are always notified.         |
@@ -107,7 +108,10 @@ the settings). Two small scripts do the work, and both can be run by hand:
 - `passwordstore-action <action> <entry> [...]` runs one action: `copy-password`,
   `copy-username`, `copy-otp`, `type-password`, `type-username` or `edit`.
   Secrets travel over pipes, never argv, and the popup has already closed when
-  it runs, so a typed password lands in the window you were in.
+  it runs, so a typed password lands in the window you were in. Copies go
+  through `wl-copy --sensitive`; the helper clears the clipboard after
+  `clipTimeSec` and scrubs `~/.local/state/omarchy/clipboard-history.json`
+  as a fallback.
 
 Recently used names are kept in `$XDG_STATE_HOME/omarchy-passwordstore/recent`
 (`~/.local/state/…`), outside the store so they are never committed with it.

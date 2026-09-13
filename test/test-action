@@ -14,11 +14,12 @@ readonly ACTION="$PLUGIN_DIR/passwordstore-action"
 
 work=$(mktemp -d) || exit 1
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/bin"
+mkdir -p "$work/bin" "$work/state/omarchy"
 export WORK="$work"
+export PASSWORDSTORE_CLIPBOARD_HISTORY="$work/state/omarchy/clipboard-history.json"
 
-# pass: `show NAME` prints a fixture, `otp -c NAME` records the call, `-c` on
-# show records the line asked for. Anything for "missing" fails like pass does.
+# pass: `show NAME` prints a fixture, `otp code NAME` prints a code. Anything
+# for "missing" fails like pass does.
 cat > "$work/bin/pass" <<'SHIM'
 #!/bin/bash
 printf '%s\n' "$*" >> "$WORK/pass.calls"
@@ -27,21 +28,19 @@ case "$*" in
   *missing*) echo "Error: missing is not in the password store." >&2; exit 1 ;;
 esac
 case $1 in
-  show)
-    case "$2" in
-      # Like the real pass, leave a background sleeper that inherits stdout
-      # and stderr: the action must not wait for it.
-      -c*) echo "copied"; (sleep 4) & exit 0 ;;
-    esac
-    printf 'hunter2\nlogin: alice@example.com\nurl: https://example.com\n' ;;
-  otp) exit 0 ;;
+  show) printf 'hunter2\nlogin: alice@example.com\nurl: https://example.com\n' ;;
+  otp) [[ $2 == code ]] && echo 123456; exit 0 ;;
   *) exit 1 ;;
 esac
 SHIM
 
 cat > "$work/bin/wl-copy" <<'SHIM'
 #!/bin/bash
-[[ ${1:-} == --clear ]] && { touch "$WORK/cleared"; exit 0; }
+printf '%s\n' "$*" >> "$WORK/wlcopy.calls"
+case ${1:-} in
+  --help) echo "    --sensitive		Hint that the content is sensitive."; exit 0 ;;
+  --clear) touch "$WORK/cleared"; : > "$WORK/clipboard"; exit 0 ;;
+esac
 cat > "$WORK/clipboard"
 SHIM
 cat > "$work/bin/wl-paste" <<'SHIM'
@@ -63,25 +62,68 @@ passed=0
 failed=0
 ok()  { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
 bad() { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
-reset() { rm -f "$work"/{pass.calls,clipboard,cleared,typed,notify.calls,recent}; }
+reset() {
+  rm -f "$work"/{pass.calls,clipboard,cleared,typed,notify.calls,recent,wlcopy.calls}
+  # Omarchy's clipboard history, as if an older wl-copy had let the password in.
+  printf '[{"type":"text","text":"keep me"},{"type":"text","text":"hunter2"},{"type":"image","path":"/tmp/x.png"}]\n' \
+    > "$work/state/omarchy/clipboard-history.json"
+}
 
 echo "passwordstore-action"
 
 reset
-start=$SECONDS
-"$ACTION" copy-password web/site --recent "$work/recent" --clip-time 7 >/dev/null 2>&1
+start=$(date +%s%N)
+"$ACTION" copy-password web/site --recent "$work/recent" --clip-time 1 >/dev/null 2>&1
 [[ $? -eq 0 ]] && ok "copy-password exits 0" || bad "copy-password exits 0"
-[[ $(( SECONDS - start )) -lt 3 ]] && ok "copy-password returns without waiting for pass's clipboard sleeper" \
-  || bad "copy-password returns without waiting for pass's clipboard sleeper"
-grep -qx 'show -c web/site' "$work/pass.calls" && ok "copy-password delegates to pass show -c" \
-  || bad "copy-password delegates to pass show -c"
-grep -q 'clears in 7 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
+# Milliseconds, not $SECONDS: a whole-second counter can tick between
+# the two readings and report a second that never passed.
+[[ $(( ( $(date +%s%N) - start ) / 1000000 )) -lt 900 ]] && ok "copy-password returns without waiting for the clipboard sleeper" \
+  || bad "copy-password returns without waiting for the clipboard sleeper"
+[[ $(cat "$work/clipboard" 2>/dev/null) == "hunter2" ]] && ok "copy-password copies the first line alone" \
+  || bad "copy-password copies the first line alone"
+grep -qx -- '--sensitive' "$work/wlcopy.calls" && ok "copy-password copies with wl-copy --sensitive (kept out of the clipboard history)" \
+  || bad "copy-password copies with wl-copy --sensitive (kept out of the clipboard history)"
+grep -q 'show -c' "$work/pass.calls" && bad "copy-password no longer uses pass -c" || ok "copy-password no longer uses pass -c"
+grep -q 'clears in 1 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
   || bad "copy-password notifies with the clip time"
-grep -qzP 'web/site\nalice@example.com\nClipboard clears in 7 s' "$work/notify.calls" \
+grep -qzP 'web/site\nalice@example.com\nClipboard clears in 1 s' "$work/notify.calls" \
   && ok "copy-password lists entry, username and clip time on separate lines" \
   || bad "copy-password lists entry, username and clip time on separate lines"
 [[ $(cat "$work/recent") == "web/site" ]] && ok "copy-password records the entry as recent" \
   || bad "copy-password records the entry as recent"
+sleep 1.6
+[[ -e $work/cleared ]] && ok "copy-password clears the clipboard after the clip time" \
+  || bad "copy-password clears the clipboard after the clip time"
+history=$(cat "$work/state/omarchy/clipboard-history.json")
+[[ $history != *hunter2* && $history == *"keep me"* && $history == *x.png* ]] \
+  && ok "copy-password removes the password from the clipboard history, nothing else" \
+  || bad "copy-password removes the password from the clipboard history, nothing else"
+
+reset
+"$ACTION" copy-password web/site --clip-time 30 --quiet >/dev/null 2>&1
+sleep 1.4
+history=$(cat "$work/state/omarchy/clipboard-history.json")
+[[ $history != *hunter2* ]] && ok "the history is scrubbed a second after the copy, not only at the clear" \
+  || bad "the history is scrubbed a second after the copy, not only at the clear"
+pkill -f '^passwordstore clip sleep' >/dev/null 2>&1; sleep 0.3
+
+reset
+"$ACTION" copy-password web/site --clip-time 2 --quiet >/dev/null 2>&1
+sleep 1.2
+"$ACTION" copy-password web/site --clip-time 2 --quiet >/dev/null 2>&1
+sleep 1.3
+[[ ! -e $work/cleared ]] && ok "a second copy restarts the clear timer" || bad "a second copy restarts the clear timer"
+sleep 1.5
+[[ -e $work/cleared ]] && ok "…and the clipboard is cleared when the new timer runs out" \
+  || bad "…and the clipboard is cleared when the new timer runs out"
+
+reset
+printf 'something else' > "$work/clipboard"
+"$ACTION" copy-password web/site --clip-time 1 --quiet >/dev/null 2>&1
+printf 'something else' > "$work/clipboard"
+sleep 1.6
+[[ ! -e $work/cleared ]] && ok "the clipboard is left alone when something else was copied since" \
+  || bad "the clipboard is left alone when something else was copied since"
 
 reset
 "$ACTION" copy-username web/site --clip-time 1 >/dev/null 2>&1
@@ -113,9 +155,11 @@ reset
   || bad "type-username types the username"
 
 reset
-"$ACTION" copy-otp web/site >/dev/null 2>&1
-grep -qx 'otp -c web/site' "$work/pass.calls" && ok "copy-otp delegates to pass otp -c" \
-  || bad "copy-otp delegates to pass otp -c"
+"$ACTION" copy-otp web/site --clip-time 1 >/dev/null 2>&1
+grep -qx 'otp code web/site' "$work/pass.calls" && ok "copy-otp asks pass otp for a code" \
+  || bad "copy-otp asks pass otp for a code"
+[[ $(cat "$work/clipboard" 2>/dev/null) == "123456" ]] && grep -qx -- '--sensitive' "$work/wlcopy.calls" \
+  && ok "copy-otp copies the code with the sensitive hint" || bad "copy-otp copies the code with the sensitive hint"
 
 reset
 "$ACTION" copy-password missing --quiet >/dev/null 2>&1

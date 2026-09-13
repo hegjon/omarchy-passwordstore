@@ -88,7 +88,7 @@ Item {
   }
 
   readonly property string storeDir: String(setting("storeDir", "")).trim()
-  readonly property int clipTimeSec: intSetting("clipTimeSec", 45, 5, 600)
+  readonly property int clipTimeSec: intSetting("clipTimeSec", 60, 5, 600)
   readonly property string usernameKeys: String(setting("usernameKeys", "login,user,username,email")).trim()
   readonly property bool allowTyping: boolSetting("allowTyping", true)
   readonly property bool notifyOnCopy: boolSetting("notifyOnCopy", true)
