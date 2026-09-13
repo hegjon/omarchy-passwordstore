@@ -14,34 +14,45 @@ readonly ACTION="$PLUGIN_DIR/passwordstore-action"
 
 work=$(mktemp -d) || exit 1
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/bin"
+mkdir -p "$work/bin" "$work/state/omarchy"
 export WORK="$work"
+export XDG_STATE_HOME="$work/state"
+export PASSWORDSTORE_CLIPBOARD_HISTORY="$work/state/omarchy/clipboard-history.json"
 
-# pass: `show NAME` prints a fixture, `otp -c NAME` records the call, `-c` on
-# show records the line asked for. Anything for "missing" fails like pass does.
+# pass: `show NAME` prints a fixture (web/site in pass's classic layout,
+# site/bob in the editor's), `otp code NAME` prints a code, `insert -m -f`
+# records what arrived on stdin, `mv` records its arguments. Anything for
+# "missing" fails like pass does.
 cat > "$work/bin/pass" <<'SHIM'
 #!/bin/bash
 printf '%s\n' "$*" >> "$WORK/pass.calls"
 printf '%s\n' "${PASSWORD_STORE_DIR:-}" > "$WORK/pass.store"
 case "$*" in
   *missing*) echo "Error: missing is not in the password store." >&2; exit 1 ;;
+  *badpass*) echo "gpg: Falsches Passwort" >&2; echo "[GNUPG:] BAD_PASSPHRASE 0123456789ABCDEF" >&2; exit 2 ;;
+  *noseckey*) echo "gpg: decryption failed: No secret key" >&2; echo "[GNUPG:] NO_SECKEY 0123456789ABCDEF" >&2; echo "[GNUPG:] DECRYPTION_FAILED" >&2; exit 2 ;;
 esac
 case $1 in
   show)
     case "$2" in
-      # Like the real pass, leave a background sleeper that inherits stdout
-      # and stderr: the action must not wait for it.
-      -c*) echo "copied"; (sleep 4) & exit 0 ;;
-    esac
-    printf 'hunter2\nlogin: alice@example.com\nurl: https://example.com\n' ;;
-  otp) exit 0 ;;
+      site/bob) printf 'p4ss w0rd!\nusername: bob\ncreated: 2026-01-02T03:04:05+00:00\nmodified: 2026-02-03T04:05:06+00:00\nurl: https://example.com\notpauth://totp/x?secret=ABC\n\nfirst note line\nsecond\n' ;;
+      crlf/one) printf 'p4ss\r\nusername: carol\r\n\r\nhello\r\n' ;;
+      *) printf 'hunter2\nlogin: alice@example.com\nurl: https://example.com\n' ;;
+    esac ;;
+  otp) [[ $2 == code ]] && echo 123456; exit 0 ;;
+  insert) cat > "$WORK/inserted"; exit 0 ;;
+  mv|rm|edit) exit 0 ;;
   *) exit 1 ;;
 esac
 SHIM
 
 cat > "$work/bin/wl-copy" <<'SHIM'
 #!/bin/bash
-[[ ${1:-} == --clear ]] && { touch "$WORK/cleared"; exit 0; }
+printf '%s\n' "$*" >> "$WORK/wlcopy.calls"
+case ${1:-} in
+  --help) echo "    --sensitive		Hint that the content is sensitive."; exit 0 ;;
+  --clear) touch "$WORK/cleared"; : > "$WORK/clipboard"; exit 0 ;;
+esac
 cat > "$WORK/clipboard"
 SHIM
 cat > "$work/bin/wl-paste" <<'SHIM'
@@ -63,25 +74,68 @@ passed=0
 failed=0
 ok()  { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
 bad() { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
-reset() { rm -f "$work"/{pass.calls,clipboard,cleared,typed,notify.calls,recent}; }
+reset() {
+  rm -f "$work"/{pass.calls,clipboard,cleared,typed,notify.calls,recent,wlcopy.calls,inserted}
+  # Omarchy's clipboard history, as if an older wl-copy had let the password in.
+  printf '[{"type":"text","text":"keep me"},{"type":"text","text":"hunter2"},{"type":"image","path":"/tmp/x.png"}]\n' \
+    > "$work/state/omarchy/clipboard-history.json"
+}
 
 echo "passwordstore-action"
 
+# --- copying ------------------------------------------------------------------
+
 reset
 start=$SECONDS
-"$ACTION" copy-password web/site --recent "$work/recent" --clip-time 7 >/dev/null 2>&1
+"$ACTION" copy-password web/site --recent "$work/recent" --clip-time 1 >/dev/null 2>&1
 [[ $? -eq 0 ]] && ok "copy-password exits 0" || bad "copy-password exits 0"
-[[ $(( SECONDS - start )) -lt 3 ]] && ok "copy-password returns without waiting for pass's clipboard sleeper" \
-  || bad "copy-password returns without waiting for pass's clipboard sleeper"
-grep -qx 'show -c web/site' "$work/pass.calls" && ok "copy-password delegates to pass show -c" \
-  || bad "copy-password delegates to pass show -c"
-grep -q 'clears in 7 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
+[[ $(( SECONDS - start )) -lt 2 ]] && ok "copy-password returns without waiting for the clipboard sleeper" \
+  || bad "copy-password returns without waiting for the clipboard sleeper"
+[[ $(cat "$work/clipboard" 2>/dev/null) == "hunter2" ]] && ok "copy-password copies the first line alone" \
+  || bad "copy-password copies the first line alone"
+grep -qx -- '--sensitive' "$work/wlcopy.calls" && ok "copy-password copies with wl-copy --sensitive (kept out of the clipboard history)" \
+  || bad "copy-password copies with wl-copy --sensitive (kept out of the clipboard history)"
+grep -q 'show -c' "$work/pass.calls" && bad "copy-password no longer uses pass -c" || ok "copy-password no longer uses pass -c"
+grep -q 'clears in 1 s' "$work/notify.calls" && ok "copy-password notifies with the clip time" \
   || bad "copy-password notifies with the clip time"
-grep -qzP 'web/site\nalice@example.com\nClipboard clears in 7 s' "$work/notify.calls" \
+grep -qzP 'web/site\nalice@example.com\nClipboard clears in 1 s' "$work/notify.calls" \
   && ok "copy-password lists entry, username and clip time on separate lines" \
   || bad "copy-password lists entry, username and clip time on separate lines"
 [[ $(cat "$work/recent") == "web/site" ]] && ok "copy-password records the entry as recent" \
   || bad "copy-password records the entry as recent"
+sleep 1.6
+[[ -e $work/cleared ]] && ok "copy-password clears the clipboard after the clip time" \
+  || bad "copy-password clears the clipboard after the clip time"
+history=$(cat "$work/state/omarchy/clipboard-history.json")
+[[ $history != *hunter2* && $history == *"keep me"* && $history == *x.png* ]] \
+  && ok "copy-password removes the password from the clipboard history, nothing else" \
+  || bad "copy-password removes the password from the clipboard history, nothing else"
+
+reset
+"$ACTION" copy-password web/site --clip-time 30 --quiet >/dev/null 2>&1
+sleep 1.4
+history=$(cat "$work/state/omarchy/clipboard-history.json")
+[[ $history != *hunter2* ]] && ok "the history is scrubbed a second after the copy, not only at the clear" \
+  || bad "the history is scrubbed a second after the copy, not only at the clear"
+pkill -f '^passwordstore clip sleep' >/dev/null 2>&1; sleep 0.3
+
+reset
+"$ACTION" copy-password web/site --clip-time 2 --quiet >/dev/null 2>&1
+sleep 1.2
+"$ACTION" copy-password web/site --clip-time 2 --quiet >/dev/null 2>&1
+sleep 1.3
+[[ ! -e $work/cleared ]] && ok "a second copy restarts the clear timer" || bad "a second copy restarts the clear timer"
+sleep 1.5
+[[ -e $work/cleared ]] && ok "…and the clipboard is cleared when the new timer runs out" \
+  || bad "…and the clipboard is cleared when the new timer runs out"
+
+reset
+printf 'something else' > "$work/clipboard"
+"$ACTION" copy-password web/site --clip-time 1 --quiet >/dev/null 2>&1
+printf 'something else' > "$work/clipboard"
+sleep 1.6
+[[ ! -e $work/cleared ]] && ok "the clipboard is left alone when something else was copied since" \
+  || bad "the clipboard is left alone when something else was copied since"
 
 reset
 "$ACTION" copy-username web/site --clip-time 1 >/dev/null 2>&1
@@ -101,6 +155,13 @@ grep -q 'No username field' "$work/notify.calls" && ok "… and says so in a not
   || bad "… and says so in a notification"
 
 reset
+"$ACTION" copy-otp web/site --clip-time 1 >/dev/null 2>&1
+grep -qx 'otp code web/site' "$work/pass.calls" && ok "copy-otp asks pass otp for a code" \
+  || bad "copy-otp asks pass otp for a code"
+[[ $(cat "$work/clipboard" 2>/dev/null) == "123456" ]] && grep -qx -- '--sensitive' "$work/wlcopy.calls" \
+  && ok "copy-otp copies the code with the sensitive hint" || bad "copy-otp copies the code with the sensitive hint"
+
+reset
 "$ACTION" type-password web/site --quiet >/dev/null 2>&1
 [[ $(cat "$work/typed" 2>/dev/null) == "hunter2" ]] && ok "type-password types the first line, no newline" \
   || bad "type-password types the first line, no newline"
@@ -111,11 +172,6 @@ reset
 "$ACTION" type-username web/site >/dev/null 2>&1
 [[ $(cat "$work/typed" 2>/dev/null) == "alice@example.com" ]] && ok "type-username types the username" \
   || bad "type-username types the username"
-
-reset
-"$ACTION" copy-otp web/site >/dev/null 2>&1
-grep -qx 'otp -c web/site' "$work/pass.calls" && ok "copy-otp delegates to pass otp -c" \
-  || bad "copy-otp delegates to pass otp -c"
 
 reset
 "$ACTION" copy-password missing --quiet >/dev/null 2>&1
@@ -143,6 +199,171 @@ reset
 "$ACTION" copy-password x --quiet >/dev/null 2>&1
 [[ -z $(cat "$work/pass.store") ]] && ok "without --store pass resolves the store itself" \
   || bad "without --store pass resolves the store itself"
+
+# --- the lockout -----------------------------------------------------------
+
+# pinentry-omarchy is real here (state under $XDG_RUNTIME_DIR); pass is the
+# stand-in, which fails "Bad passphrase" for entries named badpass/*.
+export XDG_RUNTIME_DIR="$work/run"; mkdir -p "$XDG_RUNTIME_DIR"
+PINENTRY="$PLUGIN_DIR/pinentry-omarchy"
+"$PINENTRY" --set-policy '{"attempts": 2, "lockoutSec": 60}' >/dev/null
+reset
+"$ACTION" copy-password badpass/one --quiet >/dev/null 2>&1
+[[ $(jq -r .failures <<<"$("$PINENTRY" --lockout-status)") == 1 ]] && ok "a decrypt that fails on the passphrase is reported to the lockout (by gpg's status line, in any language)" \
+  || bad "a decrypt that fails on the passphrase is reported to the lockout (by gpg's status line, in any language)"
+grep -q 'GNUPG' "$work/notify.calls" && bad "…and the status lines stay out of the notification" || ok "…and the status lines stay out of the notification"
+"$ACTION" copy-password noseckey/one --quiet >/dev/null 2>&1
+[[ $(jq -r .failures <<<"$("$PINENTRY" --lockout-status)") == 1 ]] && ok "a missing secret key is not a wrong passphrase" || bad "a missing secret key is not a wrong passphrase"
+"$ACTION" copy-password badpass/one --quiet >/dev/null 2>&1
+[[ $(jq -r .locked <<<"$("$PINENTRY" --lockout-status)") == true ]] && ok "…and enough of them lock" || bad "…and enough of them lock"
+reset
+"$ACTION" copy-password web/site --quiet >/dev/null 2>&1
+[[ $? -eq 1 && ! -e $work/clipboard ]] && grep -q 'Locked after too many' "$work/notify.calls" && ! grep -q '^show' "$work/pass.calls" \
+  && ok "while locked nothing is decrypted or copied, and the wait is notified" \
+  || bad "while locked nothing is decrypted or copied, and the wait is notified"
+"$PINENTRY" --unlock-ok >/dev/null
+reset
+"$ACTION" copy-password web/site --clip-time 1 --quiet >/dev/null 2>&1
+[[ $(jq -r .failures <<<"$("$PINENTRY" --lockout-status)") == 0 ]] && ok "a decrypt that works clears the count" || bad "a decrypt that works clears the count"
+unset XDG_RUNTIME_DIR
+
+# --- the editor: read / save / generate-password ------------------------------
+
+reset
+out=$("$ACTION" read site/bob 2>/dev/null)
+[[ $(jq -r .password <<<"$out") == 'p4ss w0rd!' ]] && ok "read: the first line is the password" || bad "read: the first line is the password"
+[[ $(jq -r .username <<<"$out") == bob ]] && ok "read: username: line" || bad "read: username: line"
+[[ $(jq -r .created <<<"$out") == 2026-01-02T03:04:05+00:00 && $(jq -r .modified <<<"$out") == 2026-02-03T04:05:06+00:00 ]] \
+  && ok "read: created and modified" || bad "read: created and modified"
+[[ $(jq -r '.notes' <<<"$out") == $'first note line\nsecond' ]] && ok "read: notes are everything after the blank line" \
+  || bad "read: notes are everything after the blank line"
+[[ $(jq -c '.extra' <<<"$out") == '["url: https://example.com","otpauth://totp/x?secret=ABC"]' ]] \
+  && ok "read: other lines (url:, otpauth://) are kept in extra" || bad "read: other lines (url:, otpauth://) are kept in extra"
+[[ ! -e $work/notify.calls ]] && ok "read notifies nothing" || bad "read notifies nothing"
+
+out=$("$ACTION" read web/site 2>/dev/null)
+[[ $(jq -r .username <<<"$out") == alice@example.com && $(jq -r .notes <<<"$out") == "" && $(jq -c .extra <<<"$out") == '["url: https://example.com"]' ]] \
+  && ok "read: a classic entry gives its login: line as the username" || bad "read: a classic entry gives its login: line as the username"
+
+out=$("$ACTION" read crlf/one 2>/dev/null)
+[[ $(jq -r .password <<<"$out") == p4ss && $(jq -r .username <<<"$out") == carol && $(jq -r .notes <<<"$out") == hello ]] \
+  && ok "read: CRLF line endings are stripped" || bad "read: CRLF line endings are stripped"
+
+out=$("$ACTION" read missing 2>/dev/null); status=$?
+[[ $status -eq 1 && -z $out ]] && ok "read: a pass failure exits 1 with nothing on stdout" || bad "read: a pass failure exits 1 with nothing on stdout"
+
+reset
+out=$(printf '{"password":"n3w!","username":"bob","notes":"a\\nb","extra":["url: https://example.com"],"created":"2026-01-02T03:04:05+00:00"}' \
+  | "$ACTION" save site/bob --recent "$work/recent" 2>/dev/null)
+[[ $(jq -r .ok <<<"$out") == true ]] && ok "save exits with ok" || bad "save exits with ok"
+grep -qx 'insert -m -f site/bob' "$work/pass.calls" && ok "save writes with pass insert -m -f" || bad "save writes with pass insert -m -f"
+[[ $(sed -n 1p "$work/inserted") == 'n3w!' ]] && ok "save: password on line 1" || bad "save: password on line 1"
+[[ $(sed -n 2p "$work/inserted") == 'username: bob' ]] && ok "save: username: on line 2" || bad "save: username: on line 2"
+[[ $(sed -n 3p "$work/inserted") == 'created: 2026-01-02T03:04:05+00:00' ]] && ok "save keeps the created stamp" || bad "save keeps the created stamp"
+grep -q '^modified: 20[0-9][0-9]-' "$work/inserted" && ok "save sets modified to now" || bad "save sets modified to now"
+[[ $(sed -n 5p "$work/inserted") == 'url: https://example.com' ]] && ok "save writes the kept lines back" || bad "save writes the kept lines back"
+[[ $(sed -n '6,8p' "$work/inserted") == $'\na\nb' ]] && ok "save: a blank line, then the notes" || bad "save: a blank line, then the notes"
+grep -q 'mv' "$work/pass.calls" && bad "save without --from does not move anything" || ok "save without --from does not move anything"
+[[ $(cat "$work/recent") == site/bob ]] && ok "save records the entry as recent" || bad "save records the entry as recent"
+grep -q 'Saved site/bob' "$work/notify.calls" && ok "save notifies" || bad "save notifies"
+
+reset
+printf '{"password":"x","username":"","notes":"","extra":[],"created":""}' | "$ACTION" save site/new --quiet >/dev/null 2>&1
+[[ $(wc -l < "$work/inserted") -eq 3 && $(sed -n 2p "$work/inserted") == created:* ]] \
+  && ok "save: no username line, no notes when they are empty" || bad "save: no username line, no notes when they are empty"
+
+reset
+printf '{"password":"x"}' | "$ACTION" save site/bob --from site/alice --quiet >/dev/null 2>&1
+grep -qx 'mv -f site/alice site/bob' "$work/pass.calls" && ok "save --from renames with pass mv first" || bad "save --from renames with pass mv first"
+
+reset
+mkdir -p "$work/exists/site"; : > "$work/exists/site/bob.gpg"
+printf '{"password":"x"}' | "$ACTION" save site/bob --store "$work/exists" --no-overwrite --quiet >/dev/null 2>&1
+[[ $? -eq 1 && ! -e $work/inserted ]] && grep -q 'already exists' "$work/notify.calls" \
+  && ok "save --no-overwrite refuses an existing entry (new entry or rename target)" \
+  || bad "save --no-overwrite refuses an existing entry (new entry or rename target)"
+printf '{"password":"x"}' | "$ACTION" save site/bob --store "$work/exists" --quiet >/dev/null 2>&1
+[[ -e $work/inserted ]] && ok "…and without it an edit overwrites its own entry" || bad "…and without it an edit overwrites its own entry"
+
+reset
+printf '{"password":""}' | "$ACTION" save site/bob --quiet >/dev/null 2>&1
+[[ $? -eq 1 && ! -e $work/inserted ]] && ok "save refuses an empty password" || bad "save refuses an empty password"
+
+reset
+printf '{"password":"x"}' | "$ACTION" save site/bob --from ../x --quiet >/dev/null 2>&1
+[[ $? -eq 2 && ! -e $work/pass.calls ]] && ok "save refuses a traversal in --from" || bad "save refuses a traversal in --from"
+
+reset
+"$ACTION" delete site/bob --quiet >/dev/null 2>&1
+[[ $? -eq 0 ]] && grep -qx 'rm -f site/bob' "$work/pass.calls" && ok "delete runs pass rm -f" || bad "delete runs pass rm -f"
+reset
+"$ACTION" delete missing --quiet >/dev/null 2>&1
+[[ $? -eq 1 ]] && grep -q 'Could not delete' "$work/notify.calls" && ok "delete reports a pass failure" || bad "delete reports a pass failure"
+
+pw=$("$ACTION" generate-password "" --length 24)
+[[ ${#pw} -eq 24 ]] && ok "generate-password honours --length" || bad "generate-password honours --length"
+[[ $pw == *[[:lower:]]* && $pw == *[[:upper:]]* && $pw == *[[:digit:]]* && $pw == *[![:alnum:]]* ]] \
+  && ok "generate-password uses every class by default" || bad "generate-password uses every class by default"
+pw=$("$ACTION" generate-password "" --length 10 --classes digit)
+[[ ${#pw} -eq 10 && $pw =~ ^[0-9]+$ ]] && ok "generate-password --classes digit gives digits only" || bad "generate-password --classes digit gives digits only"
+pw=$("$ACTION" generate-password "" --length 12 --classes lower,symbol)
+[[ ${#pw} -eq 12 && $pw != *[[:upper:]]* && $pw != *[[:digit:]]* && $pw == *[![:alnum:]]* ]] \
+  && ok "generate-password --classes lower,symbol" || bad "generate-password --classes lower,symbol"
+[[ $pw != *[\'\"\\\`\|\ ]* ]] && ok "generate-password avoids quotes, backslash, backtick, pipe and space" \
+  || bad "generate-password avoids quotes, backslash, backtick, pipe and space"
+"$ACTION" generate-password "" --length 3 >/dev/null 2>&1
+[[ $? -eq 2 ]] && ok "generate-password rejects a length under 4" || bad "generate-password rejects a length under 4"
+"$ACTION" generate-password "" --classes "" >/dev/null 2>&1
+[[ $? -eq 2 ]] && ok "generate-password rejects no classes" || bad "generate-password rejects no classes"
+
+# --- terminal actions: edit / insert / generate, with the push afterwards ------
+
+# A terminal hook that runs the script here, and a shell.json whose vault
+# has a custom push command, so --sync can be seen to run end to end.
+printf '#!/bin/bash\nexec "$@"\n' > "$work/bin/term"; chmod +x "$work/bin/term"
+export PASSWORDSTORE_TERMINAL="$work/bin/term"
+export XDG_CONFIG_HOME="$work/config"
+mkdir -p "$work/config/omarchy" "$work/store"
+jq -n --arg store "$work/store" '{bar: {layout: {left: [], center: [], right: [{
+  id: "hegjon.passwordstore", activeVaultId: "personal",
+  vaults: [{id: "personal", name: "Personal", storeDir: $store, syncBackend: "custom",
+            syncPushCmd: "touch \"$STORE/pushed\""},
+           {id: "shared", name: "Shared", storeDir: $store, syncBackend: "local"}]}]}}}' \
+  > "$work/config/omarchy/shell.json"
+wait_for() { # file
+  for _ in $(seq 1 30); do [[ -e $1 ]] && return 0; sleep 0.1; done
+  return 1
+}
+
+reset; rm -f "$work/store/pushed"
+"$ACTION" edit web/site --store "$work/store" --sync --vault personal >/dev/null 2>&1
+wait_for "$work/store/pushed" && ok "edit --sync pushes with the vault's command once pass edit is done" \
+  || bad "edit --sync pushes with the vault's command once pass edit is done"
+wait_for "$work/pass.calls" && grep -qx 'edit web/site' "$work/pass.calls" && ok "edit runs pass edit in the terminal" \
+  || bad "edit runs pass edit in the terminal"
+
+reset; rm -f "$work/store/pushed"
+"$ACTION" edit web/site --store "$work/store" >/dev/null 2>&1
+wait_for "$work/pass.calls"; sleep 0.3
+[[ ! -e $work/store/pushed ]] && ok "without --sync nothing is pushed" || bad "without --sync nothing is pushed"
+
+reset; rm -f "$work/store/pushed"
+"$ACTION" edit web/site --store "$work/store" --sync --vault shared >/dev/null 2>&1
+wait_for "$work/pass.calls"; sleep 0.3
+[[ ! -e $work/store/pushed ]] && ok "--vault picks that vault's backend (shared is local: no push)" \
+  || bad "--vault picks that vault's backend (shared is local: no push)"
+
+reset; rm -f "$work/store/pushed"
+printf '{"password":"x"}' | "$ACTION" save site/bob --store "$work/store" --sync --vault personal --quiet >/dev/null 2>&1
+[[ -e $work/store/pushed ]] && ok "save --sync pushes before it returns" || bad "save --sync pushes before it returns"
+
+reset; rm -f "$work/store/pushed"
+"$ACTION" delete site/bob --store "$work/store" --sync --vault personal --quiet >/dev/null 2>&1
+[[ -e $work/store/pushed ]] && ok "delete --sync pushes too" || bad "delete --sync pushes too"
+
+reset
+"$ACTION" copy-password "" >/dev/null 2>&1
+[[ $? -eq 2 ]] && ok "every action but generate-password needs a name" || bad "every action but generate-password needs a name"
 
 echo
 printf '%d passed, %d failed\n' "$passed" "$failed"

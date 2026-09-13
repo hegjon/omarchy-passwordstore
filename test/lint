@@ -49,7 +49,7 @@ ln -sfn "$SHELL_ROOT" "$import_root/qs"
 
 status=0
 shopt -s nullglob
-for qml in "$PLUGIN_DIR"/*.qml; do
+for qml in "$PLUGIN_DIR"/*.qml "$PLUGIN_DIR"/pinentry/*.qml; do
   echo "qmllint ${qml#"$PLUGIN_DIR"/}"
   output=$("$QMLLINT" -I "$QML_ROOT" -I "$import_root" "$qml" 2>&1)
 

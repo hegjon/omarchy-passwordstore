@@ -20,7 +20,19 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: String.fromCodePoint(0xF0306)   // nf-md-key
-    tooltipText: "Password Store"
+    // The active vault's name, read from this entry's settings: `vaults` is
+    // an array, or a string holding one when set without --json.
+    readonly property string activeVaultName: {
+      var s = root.settings || {}
+      var vaults = s.vaults
+      if (typeof vaults === "string") { try { vaults = JSON.parse(vaults) } catch (e) { vaults = [] } }
+      if (!Array.isArray(vaults) || vaults.length === 0) return ""
+      var active = String(s.activeVaultId || "")
+      for (var i = 0; i < vaults.length; i++)
+        if (vaults[i] && vaults[i].id === active) return String(vaults[i].name || vaults[i].id)
+      return String(vaults[0].name || vaults[0].id || "")
+    }
+    tooltipText: "Password Store" + (activeVaultName !== "" ? " · " + activeVaultName : "")
     slotSize: Style.bar.statusSlot
 
     onPressed: function(buttonCode) {
