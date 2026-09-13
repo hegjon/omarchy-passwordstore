@@ -1,0 +1,435 @@
+#!/bin/bash
+
+# Exercise passwordstore-setup against stand-ins for pass, gpg, rclone,
+# omarchy, notify-send and the terminal, so no real key, store, remote or
+# window is ever touched. git is real: a bare repository in $work stands in
+# for the remote. Each stand-in records what it was asked to do under $work.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly SETUP="$PLUGIN_DIR/passwordstore-setup"
+
+for tool in jq git; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "test-setup: $tool is required" >&2; exit 1; }
+done
+
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/bin" "$work/home" "$work/config/omarchy" "$work/state"
+export WORK="$work"
+export HOME="$work/home"
+export XDG_CONFIG_HOME="$work/config"
+export XDG_STATE_HOME="$work/state"
+export PASSWORDSTORE_TERMINAL="$work/bin/term"
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
+export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+unset PASSWORD_STORE_DIR
+
+readonly ALICE=ABCDEF0123456789ABCDEF0123456789ABCDEF01   # secret key
+readonly BOB=FEDCBA9876543210FEDCBA9876543210FEDCBA98     # secret key, expired
+readonly CAROL=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   # public key only
+
+# The terminal hook: run the script here and now, no window.
+printf '#!/bin/bash\nexec "$@"\n' > "$work/bin/term"
+
+# pass: init writes .gpg-id, git delegates to git in the store, the rest is
+# recorded and succeeds.
+cat > "$work/bin/pass" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/pass.calls"
+store=${PASSWORD_STORE_DIR:-$HOME/.password-store}
+case ${1:-} in
+  init)
+    shift; mkdir -p "$store"; printf '%s\n' "$@" > "$store/.gpg-id"
+    echo "Password store initialized for $*" ;;
+  git)
+    shift
+    if [[ ${1:-} == init ]]; then
+      git -C "$store" init -q -b main && git -C "$store" add -A \
+        && git -C "$store" commit -q --allow-empty -m "Add current contents of password store."
+    else
+      git -C "$store" "$@"
+    fi ;;
+  *) exit 0 ;;
+esac
+SHIM
+
+# gpg: three keys in colon format (Alice: secret; Bob: secret but expired,
+# with an escaped colon in the uid; Carol: public only), lookups by
+# fingerprint fragment or e-mail, import and generate recorded.
+cat > "$work/bin/gpg" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/gpg.calls"
+secret_colons() {
+  cat <<'EOF'
+sec:u:255:22:0123456789ABCDEF:1700000000:::u:::scESC:::+:::ed25519:::0:
+fpr:::::::::ABCDEF0123456789ABCDEF0123456789ABCDEF01:
+uid:u::::1700000000::H1::Alice Example <alice@example.com>::::::::::0:
+ssb:u:255:18:1111111111111111:1700000000::::::e:::+:::cv25519::
+fpr:::::::::1111111111111111111111111111111111111111:
+sec:e:3072:1:FEDCBA9876543210:1600000000:1650000000::u:::scESC:::+:::23::0:
+fpr:::::::::FEDCBA9876543210FEDCBA9876543210FEDCBA98:
+uid:e::::1600000000::H2::Bob\x3a Old <bob@example.com>::::::::::0:
+EOF
+}
+public_colons() {
+  secret_colons | sed 's/^sec:/pub:/; s/^ssb:/sub:/'
+  cat <<'EOF'
+pub:u:255:22:AAAAAAAAAAAAAAAA:1700000000:::u:::scESC:::::ed25519:::0:
+fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:
+uid:u::::1700000000::H3::Carol Teammate <carol@example.com>::::::::::0:
+EOF
+}
+known() { # id, list of fingerprints/emails
+  local id=${1^^}; shift
+  for k in "$@"; do [[ ${k^^} == *"$id"* ]] && return 0; done
+  return 1
+}
+args=("$@")
+last=${args[-1]}
+case " $* " in
+  *" -e -o /dev/null "*)
+    # init asks gpg whether it could encrypt to each recipient before it
+    # rewrites anything: encryptable here means the keyring knows the key.
+    r=""; for ((i = 0; i < ${#args[@]}; i++)); do [[ ${args[i]} == -r ]] && r=${args[i+1]}; done
+    exec "$0" --batch --list-keys -- "$r" >/dev/null ;;
+  *" --with-colons "*)
+    case " $* " in
+      *" --list-secret-keys "*) secret_colons ;;
+      *) public_colons ;;
+    esac ;;
+  *" --list-secret-keys "*)
+    known "$last" ABCDEF0123456789ABCDEF0123456789ABCDEF01 alice@example.com \
+      FEDCBA9876543210FEDCBA9876543210FEDCBA98 bob@example.com ;;
+  *" --list-keys "*)
+    known "$last" ABCDEF0123456789ABCDEF0123456789ABCDEF01 alice@example.com \
+      FEDCBA9876543210FEDCBA9876543210FEDCBA98 bob@example.com \
+      AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA carol@example.com ;;
+  *" --import "*)
+    if grep -qE 'SECRET|PRIVATE' "$last" 2>/dev/null; then
+      echo "gpg: key 0123456789ABCDEF: secret key imported" >&2
+    else
+      echo "gpg: key AAAAAAAAAAAAAAAA: public key \"Carol\" imported" >&2
+    fi ;;
+  *" --show-keys "*)
+    if grep -qE 'SECRET|PRIVATE' "$last" 2>/dev/null; then secret_colons
+    else public_colons
+    fi ;;
+  *" --full-generate-key "*) touch "$WORK/generated" ;;
+  *) exit 1 ;;
+esac
+SHIM
+
+# rclone: records the transfer; a source or destination under bad: fails.
+cat > "$work/bin/rclone" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/rclone.calls"
+case "$*" in *bad:*) echo "Failed to copy: directory not found" >&2; exit 1 ;; esac
+exit 0
+SHIM
+
+cat > "$work/bin/omarchy" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/omarchy.calls"
+SHIM
+cat > "$work/bin/notify-send" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "$WORK/notify.calls"
+SHIM
+chmod +x "$work/bin/"*
+export PATH="$work/bin:$PATH"
+
+passed=0
+failed=0
+ok()  { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+bad() { printf '  FAIL  %s\n' "$1"; failed=$(( failed + 1 )); }
+check() { # description, jq filter, json
+  if jq -e "$2" <<<"$3" >/dev/null 2>&1; then ok "$1"; else bad "$1 — got: ${3:0:200}"; fi
+}
+reset() { rm -f "$work"/{pass,gpg,rclone,omarchy,notify}.calls "$work/generated"; }
+
+# The widget's bar entry, as the shell writes it.
+write_shell_json() { # entry JSON (without id)
+  jq -n --argjson entry "$1" '{bar: {layout: {left: [], center: [], right: [
+    ($entry + {id: "hegjon.passwordstore"})]}}}' > "$work/config/omarchy/shell.json"
+}
+write_shell_json '{}'
+
+echo "passwordstore-setup"
+
+# --- status and gpg-list -------------------------------------------------
+
+out=$("$SETUP" status)
+check "status: is JSON with the legacy vault id when nothing is configured" \
+  '.vault.id == "personal" and .vaults == []' "$out"
+check "status: no store means not usable" '.usable == false and .storeExists == false' "$out"
+check "status: detects the tools with command -v" '.deps.pass == true and .deps.gnupg == true' "$out"
+[[ $(jq -r .store <<<"$out") == "$HOME/.password-store" ]] \
+  && ok "status: defaults the store to ~/.password-store" || bad "status: defaults the store to ~/.password-store"
+check "status: carries the sync status" '.sync.backend == "local" and .sync.configured == true' "$out"
+
+out=$("$SETUP" gpg-list)
+check "gpg-list: merges secret and public keys, secret ones first" \
+  '(.keys | length) == 3 and .keys[0].secret == true and .keys[2].secret == false' "$out"
+check "gpg-list: decodes the colon escape in a uid and flags expiry" \
+  '.keys | map(select(.fpr == "'"$BOB"'")) | .[0] | .uid == "Bob: Old <bob@example.com>" and .expired == true' "$out"
+check "gpg-list: a teammate's public key is listed as not secret" \
+  '.keys | map(select(.fpr == "'"$CAROL"'")) | .[0].secret == false' "$out"
+
+# --- init ----------------------------------------------------------------
+
+reset
+s1="$work/store1"
+out=$("$SETUP" init --store "$s1" --gpg-id "$ALICE")
+check "init: creates the store and reports it usable" '.ok == true and .usable == true and .storeExists == true' "$out"
+grep -qx "init $ALICE" "$work/pass.calls" && ok "init: runs pass init with the key" || bad "init: runs pass init with the key"
+[[ $(cat "$s1/.gpg-id") == "$ALICE" ]] && ok "init: .gpg-id holds the key" || bad "init: .gpg-id holds the key"
+check "init: the store's key is found in the keyring" '.secretKeyPresent == true and .gpgIds == ["'"$ALICE"'"]' "$out"
+
+out=$("$SETUP" init --store "$s1" --gpg-id "$ALICE")
+check "init: the same key again is a no-op" '.ok == true and .skipped == true' "$out"
+
+out=$("$SETUP" init --store "$s1" --gpg-id "$ALICE" --gpg-id "$CAROL")
+check "init: another recipient set needs --reencrypt" '.ok == false and .needsReencrypt == true' "$out"
+out=$("$SETUP" init --store "$s1" --gpg-id "$ALICE" --gpg-id "$CAROL" --reencrypt)
+check "init: --reencrypt re-inits for both recipients" '.ok == true and (.gpgIds | length) == 2' "$out"
+grep -qx "init $ALICE $CAROL" "$work/pass.calls" && ok "init: pass init gets every recipient" \
+  || bad "init: pass init gets every recipient"
+
+out=$("$SETUP" init --store "$work/store-carol" --gpg-id "$CAROL")
+check "init: refuses a set with no secret key of ours" '.error | test("secret")' "$out"
+out=$("$SETUP" init --store "$work/store-x" --gpg-id nobody@example.com)
+check "init: refuses an unknown key" '.error | test("No key")' "$out"
+out=$("$SETUP" init --store "$work/store-x" --gpg-id -- --gpg-id "$ALICE")
+check "init: refuses a key id that looks like an option" '.error | test("Not a key id")' "$out"
+
+# --- vault resolution from shell.json --------------------------------------
+
+reset
+s2="$work/store2"; mkdir -p "$s2"; printf '%s\n' "$ALICE" > "$s2/.gpg-id"
+write_shell_json "$(jq -n --arg s1 "$s1" --arg s2 "$s2" '{
+  storeDir: "/nowhere", syncBackend: "git", activeVaultId: "shared",
+  vaults: [
+    {id: "personal", name: "Personal", storeDir: $s1, syncBackend: "custom",
+     syncPushCmd: "touch \"$STORE/pushed\"", syncPullCmd: "touch \"$STORE/pulled\""},
+    {id: "shared", name: "Shared", storeDir: $s2, syncBackend: "custom",
+     syncPushCmd: "echo nope >&2; false"}
+  ]}')"
+
+out=$("$SETUP" status)
+check "vaults: the active vault is used when none is named" \
+  '.vault.id == "shared" and .vault.name == "Shared" and .store == "'"$s2"'"' "$out"
+check "vaults: status lists every vault" '(.vaults | length) == 2 and .vaults[0].id == "personal"' "$out"
+out=$("$SETUP" status --vault personal)
+check "vaults: --vault picks another" '.vault.id == "personal" and .store == "'"$s1"'"' "$out"
+out=$("$SETUP" status --vault nope)
+check "vaults: an unknown --vault is an error" '.error | test("No vault named nope")' "$out"
+out=$("$SETUP" sync-status --vault personal)
+check "vaults: sync settings come from the vault, not the entry" '.backend == "custom" and .configured == true' "$out"
+
+out=$("$SETUP" sync-push --vault personal)
+check "sync-push: custom command runs in the store with \$STORE" '.ok == true and .backend == "custom"' "$out"
+[[ -e $s1/pushed ]] && ok "sync-push: …and it did run there" || bad "sync-push: …and it did run there"
+out=$("$SETUP" sync-push)
+check "sync-push: a failing command reports the error" '.ok == false and (.error | test("nope"))' "$out"
+grep -q "sync failed" "$work/notify.calls" && ok "sync-push: …and notifies" || bad "sync-push: …and notifies"
+out=$("$SETUP" sync-pull --vault personal)
+check "sync-pull: custom pull command runs" '.ok == true' "$out"
+[[ -e $s1/pulled ]] && ok "sync-pull: …in the store" || bad "sync-pull: …in the store"
+
+# vaults set with `omarchy bar set` and no --json arrive as a string.
+write_shell_json "$(jq -n --arg s1 "$s1" '{activeVaultId: "p",
+  vaults: ([{id: "p", name: "P", storeDir: $s1, syncBackend: "local"}] | tojson)}')"
+out=$("$SETUP" status)
+check "vaults: a JSON string holding the array is accepted" '.vault.id == "p" and .store == "'"$s1"'"' "$out"
+
+# Legacy: no vaults, the entry's own keys.
+write_shell_json "$(jq -n --arg s1 "$s1" '{storeDir: $s1, syncBackend: "custom", syncPushCmd: "touch \"$STORE/pushed-legacy\""}')"
+out=$("$SETUP" status)
+check "legacy: the entry's storeDir is the personal vault" '.vault.id == "personal" and .store == "'"$s1"'" and .usable == true' "$out"
+out=$("$SETUP" sync-push --vault personal)
+[[ $(jq -r .ok <<<"$out") == true && -e $s1/pushed-legacy ]] \
+  && ok "legacy: --vault personal falls back to the entry's sync settings" \
+  || bad "legacy: --vault personal falls back to the entry's sync settings"
+
+# shellcheck disable=SC2088  # the literal tilde is the point: the script expands it
+out=$("$SETUP" status --store "~/tilde/")
+[[ $(jq -r .store <<<"$out") == "$HOME/tilde" ]] && ok "--store expands ~ and drops the trailing slash" \
+  || bad "--store expands ~ and drops the trailing slash"
+
+# --- local and pull failures ------------------------------------------------
+
+reset
+write_shell_json '{}'
+out=$("$SETUP" sync-push --store "$s1" --backend local)
+check "local: push is skipped" '.ok == true and .skipped == true' "$out"
+out=$("$SETUP" sync-pull --store "$s1" --backend custom --pull-cmd "")
+check "custom: an empty pull command is fine" '.ok == true' "$out"
+
+reset
+"$SETUP" sync-pull --store "$s1" --backend custom --pull-cmd "echo offline >&2; false" >/dev/null
+"$SETUP" sync-pull --store "$s1" --backend custom --pull-cmd "echo offline >&2; false" >/dev/null
+[[ $(grep -c "could not pull" "$work/notify.calls") -eq 1 ]] \
+  && ok "pull: the same failure notifies once, not on every open" \
+  || bad "pull: the same failure notifies once, not on every open"
+out=$("$SETUP" sync-pull --store "$s1" --backend custom --pull-cmd "false" --quiet)
+[[ $(grep -c "could not pull" "$work/notify.calls") -eq 1 ]] && ok "pull: --quiet never notifies" || bad "pull: --quiet never notifies"
+
+# --- git -------------------------------------------------------------------
+
+reset
+s3="$work/store3"; mkdir -p "$s3/web"; printf '%s\n' "$ALICE" > "$s3/.gpg-id"; : > "$s3/web/site.gpg"
+remote="$work/remote.git"; git init -q --bare -b main "$remote"
+out=$("$SETUP" sync-setup --store "$s3" --backend git --git-remote "file://$remote")
+check "git: sync-setup inits the repo and pushes the first branch" '.ok == true and (.detail | test("Pushed main"))' "$out"
+[[ $(git -C "$remote" rev-parse --abbrev-ref HEAD) == main && $(git -C "$remote" ls-tree --name-only -r main | grep -c 'web/site.gpg') -eq 1 ]] \
+  && ok "git: …the remote has the entry" || bad "git: …the remote has the entry"
+out=$("$SETUP" sync-status --store "$s3" --backend git)
+check "git: sync-status sees the upstream" '.configured == true' "$out"
+
+: > "$s3/web/other.gpg"; git -C "$s3" add -A; git -C "$s3" commit -q -m "add other"
+out=$("$SETUP" sync-push --store "$s3" --backend git)
+check "git: sync-push pushes" '.ok == true' "$out"
+[[ $(git -C "$remote" ls-tree --name-only -r main | grep -c 'web/other.gpg') -eq 1 ]] \
+  && ok "git: …and the remote has the new entry" || bad "git: …and the remote has the new entry"
+grep -qx "git push --quiet" "$work/pass.calls" && ok "git: the push goes through pass git" || bad "git: the push goes through pass git"
+
+# A seat where git has no identity at all: the first commit must still happen.
+reset
+s3b="$work/store3b"; mkdir -p "$s3b/web"; printf '%s\n' "$ALICE" > "$s3b/.gpg-id"; : > "$s3b/web/site.gpg"
+remote_b="$work/remote-b.git"; git init -q --bare -b main "$remote_b"
+out=$(HOME="$work/nohome" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null "$SETUP" sync-setup --store "$s3b" --backend git --git-remote "file://$remote_b")
+check "git: without a git identity sync-setup still makes the first commit and pushes" '.ok == true' "$out"
+[[ $(git -C "$remote_b" ls-tree --name-only -r main 2>/dev/null | grep -c 'web/site.gpg') -eq 1 ]] \
+  && ok "git: …with the entries in it" || bad "git: …with the entries in it"
+[[ -n $(git -C "$s3b" config user.email) ]] && ok "git: …under a local identity" || bad "git: …under a local identity"
+
+s4="$work/store4"
+"$SETUP" init --store "$s4" --gpg-id "$ALICE" >/dev/null
+out=$("$SETUP" sync-setup --store "$s4" --backend git --git-remote "file://$remote")
+check "git: an empty store joining a remote with commits fetches instead of pushing" '.ok == true and .fetched == true' "$out"
+[[ -e $s4/web/site.gpg ]] && ok "git: …and now holds the remote's entries" || bad "git: …and now holds the remote's entries"
+out=$("$SETUP" sync-pull --store "$s4" --backend git)
+check "git: sync-pull rebases on the upstream" '.ok == true' "$out"
+grep -qx "git pull --rebase --quiet" "$work/pass.calls" && ok "git: …through pass git pull --rebase" || bad "git: …through pass git pull --rebase"
+
+out=$("$SETUP" sync-push --store "$s1" --backend git)
+check "git: pushing a store that is not a repository is an error, not a crash" '.ok == false and (.error | test("not a git repository"))' "$out"
+out=$("$SETUP" sync-setup --store "$s1" --backend git --git-remote "")
+check "git: sync-setup without a remote URL is an error" '.error | test("remote URL")' "$out"
+
+# --- rclone ------------------------------------------------------------------
+
+reset
+out=$("$SETUP" sync-setup --store "$s3" --backend rclone --rclone-remote "r:pass")
+check "rclone: a full store asks before the first upload" '.needsConfirm == true and .entries == 2' "$out"
+[[ ! -e $work/rclone.calls ]] && ok "rclone: …and nothing ran" || bad "rclone: …and nothing ran"
+out=$("$SETUP" sync-setup --store "$s3" --backend rclone --rclone-remote "r:pass" --confirm)
+check "rclone: --confirm uploads" '.ok == true' "$out"
+grep -q "^copy $s3 r:pass --exclude .git/\*\*" "$work/rclone.calls" && ok "rclone: …with rclone copy store → remote, .git excluded" \
+  || bad "rclone: …with rclone copy store → remote, .git excluded"
+
+reset
+s5="$work/store5"; "$SETUP" init --store "$s5" --gpg-id "$ALICE" >/dev/null
+out=$("$SETUP" sync-setup --store "$s5" --backend rclone --rclone-remote "r:pass")
+check "rclone: an empty store is filled from the remote" '.ok == true and .fetched == true' "$out"
+grep -q "^copy r:pass $s5" "$work/rclone.calls" && ok "rclone: …with rclone copy remote → store" || bad "rclone: …with rclone copy remote → store"
+
+reset
+out=$("$SETUP" sync-push --store "$s3" --backend rclone --rclone-remote "r:pass")
+grep -q "^copy $s3 r:pass" "$work/rclone.calls" && ok "rclone: push defaults to copy" || bad "rclone: push defaults to copy"
+out=$("$SETUP" sync-push --store "$s3" --backend rclone --rclone-remote "r:pass" --rclone-mode sync)
+grep -q "^sync $s3 r:pass" "$work/rclone.calls" && ok "rclone: --rclone-mode sync syncs" || bad "rclone: --rclone-mode sync syncs"
+out=$("$SETUP" sync-pull --store "$s3" --backend rclone --rclone-remote "r:pass" --rclone-mode sync)
+grep -q "^copy r:pass $s3" "$work/rclone.calls" && ok "rclone: a pull is always a copy" || bad "rclone: a pull is always a copy"
+out=$("$SETUP" sync-push --store "$s3" --backend rclone --rclone-remote "bad:pass")
+check "rclone: a failed transfer is reported" '.ok == false and (.error | test("not found"))' "$out"
+out=$("$SETUP" sync-setup --store "$s3" --backend rclone --rclone-remote "nocolon")
+check "rclone: a path without remote: is refused" '.error | test("remote:path")' "$out"
+
+# --- gpg in a terminal, import, install -----------------------------------------
+
+reset
+out=$("$SETUP" gpg-generate)
+[[ -e $work/generated ]] && ok "gpg-generate: runs gpg --full-generate-key in the terminal" || bad "gpg-generate: runs gpg --full-generate-key in the terminal"
+check "gpg-generate: rescans afterwards" '(.keys | length) == 3 and .status == 0' "$out"
+
+printf '%s\n' '-----BEGIN PGP PRIVATE KEY BLOCK-----' > "$work/secret.asc"
+printf '%s\n' '-----BEGIN PGP PUBLIC KEY BLOCK-----' > "$work/public.asc"
+out=$("$SETUP" gpg-import --file "$work/secret.asc")
+check "gpg-import: a secret key file is imported" '.importedSecret == true and .kind == "secret"' "$out"
+out=$("$SETUP" gpg-import --file "$work/public.asc")
+check "gpg-import: a public-only file says so" '.importedSecret == false and .kind == "public"' "$out"
+
+out=$("$SETUP" gpg-inspect --file "$work/secret.asc")
+check "gpg-inspect: private armor is secret" '.kind == "secret" and .exists == true' "$out"
+out=$("$SETUP" gpg-inspect --file "$work/public.asc")
+check "gpg-inspect: public armor is public" '.kind == "public"' "$out"
+out=$("$SETUP" gpg-inspect --file "$work/missing.asc")
+check "gpg-inspect: a missing file is missing" '.kind == "missing" and .exists == false' "$out"
+
+mkdir -p "$HOME/Downloads"
+printf '%s\n' '-----BEGIN PGP PRIVATE KEY BLOCK-----' > "$HOME/secret.asc"
+printf '%s\n' '-----BEGIN PGP PUBLIC KEY BLOCK-----' > "$HOME/Downloads/team.asc"
+out=$("$SETUP" gpg-inspect)
+check "gpg-inspect: ~/secret.asc is the private default" '.defaults.secret.path == "~/secret.asc"' "$out"
+check "gpg-inspect: Downloads public key is the public default" '.defaults.public.path == "~/Downloads/team.asc"' "$out"
+out=$("$SETUP" gpg-import --file "$work/missing.asc")
+check "gpg-import: a missing file is an error" '.error | test("Cannot read")' "$out"
+grep -q -- "--import -- $work/secret.asc" "$work/gpg.calls" && ok "gpg-import: the path is handed to gpg after --" \
+  || bad "gpg-import: the path is handed to gpg after --"
+
+reset
+out=$("$SETUP" install pass wtype)
+grep -qx "pkg add pass wtype" "$work/omarchy.calls" && ok "install: runs omarchy pkg add in the terminal" \
+  || bad "install: runs omarchy pkg add in the terminal"
+check "install: returns the status afterwards" '.installStatus == 0 and .deps.pass == true' "$out"
+out=$("$SETUP" install 'pass;rm')
+check "install: refuses a package name with shell characters" '.error | test("Not a package name")' "$out"
+
+"$SETUP" >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "no command exits 2" || bad "no command exits 2"
+"$SETUP" status --bogus >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "an unknown option exits 2" || bad "an unknown option exits 2"
+
+# --- pinentry ---------------------------------------------------------------
+
+export GNUPGHOME="$work/gnupg"; mkdir -p "$GNUPGHOME"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "$WORK/gpgconf.calls"\n' > "$work/bin/gpgconf"; chmod +x "$work/bin/gpgconf"
+printf 'default-cache-ttl 600\n' > "$GNUPGHOME/gpg-agent.conf"
+out=$("$SETUP" pinentry)
+check "pinentry: reports default when gpg-agent.conf names no program" '.ok == true and .pinentry == "default"' "$out"
+out=$("$SETUP" pinentry --enable)
+check "pinentry --enable: reports omarchy" '.ok == true and .pinentry == "omarchy"' "$out"
+grep -q '^pinentry-program .*/pinentry-omarchy$' "$GNUPGHOME/gpg-agent.conf" && grep -qx 'default-cache-ttl 600' "$GNUPGHOME/gpg-agent.conf" \
+  && ok "pinentry --enable: writes the line and keeps the rest of gpg-agent.conf" \
+  || bad "pinentry --enable: writes the line and keeps the rest of gpg-agent.conf"
+grep -qx -- '--reload gpg-agent' "$work/gpgconf.calls" && ok "pinentry --enable: reloads the agent" || bad "pinentry --enable: reloads the agent"
+[[ $(stat -c %a "$GNUPGHOME/gpg-agent.conf") == 600 ]] && ok "pinentry: the conf stays private (600)" || bad "pinentry: the conf stays private (600)"
+printf 'pinentry-program /usr/bin/pinentry-qt\n' > "$GNUPGHOME/gpg-agent.conf"
+out=$("$SETUP" pinentry)
+check "pinentry: another program reports other" '.pinentry == "other"' "$out"
+out=$("$SETUP" pinentry --disable)
+check "pinentry --disable: back to default" '.pinentry == "default"' "$out"
+grep -q pinentry-program "$GNUPGHOME/gpg-agent.conf" && bad "pinentry --disable: drops the line" || ok "pinentry --disable: drops the line"
+unset GNUPGHOME
+
+# --- lockout policy ---------------------------------------------------------
+
+export XDG_RUNTIME_DIR="$work/run2"; mkdir -p "$XDG_RUNTIME_DIR"
+out=$("$SETUP" lockout-policy --vault personal)
+check "lockout-policy: defaults when the settings are unset" '.ok == true and .policy.attempts == 5 and .policy.lockoutSec == 30 and .policy.lockSession == false' "$out"
+jq '(.bar.layout.right[0]) += {unlockAttempts: 3, unlockLockoutSec: 10, lockSessionOnLockout: true}' "$XDG_CONFIG_HOME/omarchy/shell.json" > "$work/sj" && mv "$work/sj" "$XDG_CONFIG_HOME/omarchy/shell.json"
+out=$("$SETUP" lockout-policy --vault personal)
+check "lockout-policy: takes the entry's settings" '.policy.attempts == 3 and .policy.lockoutSec == 10 and .policy.lockSession == true' "$out"
+[[ $(jq -r .attempts "$XDG_RUNTIME_DIR/pinentry-omarchy/policy.json") == 3 ]] && ok "lockout-policy: pinentry-omarchy has it" || bad "lockout-policy: pinentry-omarchy has it"
+out=$("$SETUP" status --vault personal)
+check "status: reports the lockout" '.lockout.locked == false and .lockout.attempts == 3' "$out"
+unset XDG_RUNTIME_DIR
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))
