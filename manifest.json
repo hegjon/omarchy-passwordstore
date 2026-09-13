@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "hegjon.passwordstore",
   "name": "Password Store",
-  "version": "0.2.1",
+  "version": "0.5.0",
   "author": "Jonny Heggheim",
   "license": "MIT",
-  "description": "pass, the standard unix password manager, as an Omarchy launcher: press a key, type to search your store, then copy or type a password, username or OTP code. Decryption and clipboard clearing are left to pass itself.",
+  "description": "pass, the standard unix password manager, as an Omarchy launcher: press a key, type to search your store by site or username, then copy or type a password, username or OTP code. Add and edit entries in a masked form with a reveal, a colour-coded readout and a generator. Copies carry the password-manager hint so the clipboard history never records them, and the clipboard is cleared after a minute. gpg-agent can ask for passphrases with an Omarchy-styled prompt. First open walks a new seat through the GPG key, pass init and how the vault syncs (local, git, rclone or a custom command).",
   "homepage": "https://github.com/hegjon/omarchy-passwordstore",
   "repository": "https://github.com/hegjon/omarchy-passwordstore",
   "keywords": [
@@ -16,7 +16,10 @@
     "passwords",
     "gpg",
     "otp",
-    "clipboard"
+    "clipboard",
+    "git",
+    "rclone",
+    "sync"
   ],
   "kinds": [
     "overlay",
@@ -33,29 +36,58 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
+      "vaults": [],
+      "activeVaultId": "",
       "storeDir": "",
-      "clipTimeSec": 45,
+      "clipTimeSec": 60,
       "usernameKeys": "login,user,username,email",
       "allowTyping": true,
-      "notifyOnCopy": true
+      "notifyOnCopy": true,
+      "syncBackend": "local",
+      "gitRemote": "",
+      "gitPullOnOpen": true,
+      "rcloneRemote": "",
+      "rcloneMode": "copy",
+      "rclonePullOnOpen": true,
+      "syncPushCmd": "",
+      "syncPullCmd": "",
+      "usernameInPath": true,
+      "unlockAttempts": 5,
+      "unlockLockoutSec": 30,
+      "lockSessionOnLockout": false,
+      "lockoutNoLoopback": false
     },
     "schema": [
+      {
+        "key": "vaults",
+        "type": "string",
+        "label": "Vaults",
+        "description": "JSON array of vault records, one per password store: {id, name, storeDir, gpgIds, syncBackend, gitRemote, gitPullOnOpen, rcloneRemote, rcloneMode, rclonePullOnOpen, syncPushCmd, syncPullCmd}. The setup card (F2) maintains it; by hand, omarchy bar set \u2026 vaults '[\u2026]' without --json (the array arrives as a string and is parsed back). Empty: the single store described by the keys below.",
+        "defaultValue": []
+      },
+      {
+        "key": "activeVaultId",
+        "type": "string",
+        "label": "Active vault",
+        "description": "The id of the vault the card searches. Tab in the card switches it.",
+        "defaultValue": ""
+      },
       {
         "key": "storeDir",
         "type": "string",
         "label": "Password store directory",
-        "description": "Leave empty to use $PASSWORD_STORE_DIR or ~/.password-store, exactly as pass does.",
+        "description": "One-store installs without a vaults array: the store. Leave empty to use $PASSWORD_STORE_DIR or ~/.password-store, exactly as pass does. Vaults carry their own storeDir.",
         "defaultValue": ""
       },
       {
         "key": "clipTimeSec",
         "type": "integer",
         "label": "Clear the clipboard after (seconds)",
-        "description": "Passed to pass as PASSWORD_STORE_CLIP_TIME. pass's own default is 45.",
+        "description": "Copied passwords, usernames and OTP codes are cleared from the clipboard after this long, and scrubbed from the clipboard history should it have recorded one (copies carry the password-manager hint, so it normally does not). Also passed to pass as PASSWORD_STORE_CLIP_TIME for the terminal actions.",
         "min": 5,
         "max": 600,
         "step": 5,
-        "defaultValue": 45
+        "defaultValue": 60
       },
       {
         "key": "usernameKeys",
@@ -63,6 +95,13 @@
         "label": "Username field names",
         "description": "Comma-separated keys, matched case-insensitively against the 'key: value' lines of an entry. Falls back to the second line of the entry.",
         "defaultValue": "login,user,username,email"
+      },
+      {
+        "key": "usernameInPath",
+        "type": "boolean",
+        "label": "Store entries as name/username",
+        "description": "On: an entry's last path segment is its username (github.com/jack), so the list shows both without decrypting and the editor names new entries that way. Off: pass's classic folder/entry layout; the row shows the folder under the entry and the username stays inside the file.",
+        "defaultValue": true
       },
       {
         "key": "allowTyping",
@@ -76,6 +115,94 @@
         "type": "boolean",
         "label": "Show a notification when something is copied",
         "defaultValue": true
+      },
+      {
+        "key": "syncBackend",
+        "type": "string",
+        "label": "Sync backend",
+        "description": "One-store installs: local (nothing leaves this machine), git (pass git push after a change), rclone (rclone copy/sync to a configured remote) or custom (your own push/pull commands). Vaults carry their own. The setup card (F2) fills this in.",
+        "defaultValue": "local"
+      },
+      {
+        "key": "gitRemote",
+        "type": "string",
+        "label": "git remote URL",
+        "description": "https or ssh URL of the store's origin. Credentials stay with git and ssh.",
+        "defaultValue": ""
+      },
+      {
+        "key": "gitPullOnOpen",
+        "type": "boolean",
+        "label": "git: pull --rebase when the card opens",
+        "defaultValue": true
+      },
+      {
+        "key": "rcloneRemote",
+        "type": "string",
+        "label": "rclone remote path",
+        "description": "remote:path of an rclone remote you have already configured with `rclone config`. Tokens stay in rclone's own config.",
+        "defaultValue": ""
+      },
+      {
+        "key": "rcloneMode",
+        "type": "string",
+        "label": "rclone push mode",
+        "description": "copy never deletes anything on the remote; sync makes the remote match the store, deletions included.",
+        "defaultValue": "copy"
+      },
+      {
+        "key": "rclonePullOnOpen",
+        "type": "boolean",
+        "label": "rclone: copy from the remote when the card opens",
+        "defaultValue": true
+      },
+      {
+        "key": "syncPushCmd",
+        "type": "string",
+        "label": "custom: push command",
+        "description": "Run with bash -lc in the store after a change; $STORE is the store directory. Never put a secret in it.",
+        "defaultValue": ""
+      },
+      {
+        "key": "syncPullCmd",
+        "type": "string",
+        "label": "custom: pull command",
+        "description": "Run with bash -lc in the store when the card opens. May be empty.",
+        "defaultValue": ""
+      },
+      {
+        "key": "unlockAttempts",
+        "type": "integer",
+        "label": "Wrong passphrases before a lockout",
+        "description": "Counted by pinentry-omarchy across requests within ten minutes; the card and the helper refuse to decrypt while locked.",
+        "min": 2,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "unlockLockoutSec",
+        "type": "integer",
+        "label": "First lockout (seconds)",
+        "description": "Each further lockout is four times longer, up to thirty minutes. A decrypt that works resets everything.",
+        "min": 10,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 30
+      },
+      {
+        "key": "lockSessionOnLockout",
+        "type": "boolean",
+        "label": "Lock the session at the longest lockout",
+        "description": "Off by default. On, reaching the thirty-minute tier also runs omarchy-system-lock, on the theory that the seat is not in its owner's hands.",
+        "defaultValue": false
+      },
+      {
+        "key": "lockoutNoLoopback",
+        "type": "boolean",
+        "label": "Refuse loopback pinentry (lockout coverage)",
+        "description": "Off by default. On, gpg-agent.conf gets no-allow-loopback-pinentry, so `gpg --pinentry-mode loopback` (which never passes through the prompt and so cannot be counted) is refused; other tools that rely on loopback stop working.",
+        "defaultValue": false
       }
     ]
   },
