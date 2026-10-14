@@ -5,6 +5,7 @@ import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Centered type-to-search overlay for pass, the standard unix password
@@ -112,14 +113,14 @@ Item {
 
   // --- look: the menu's tokens ------------------------------------------
 
-  property color background: Color.menu.background
-  property color foreground: Color.menu.text
-  property color border: Color.menu.border
+  property color background: Commons.Color.menu.background
+  property color foreground: Commons.Color.menu.text
+  property color border: Commons.Color.menu.border
   property var borderSpec: Border.surfaceSpec("menu", "border", border, Math.max(1, Style.space(2)))
-  property color scrim: Color.menu.scrim
-  property color selectedBackground: Color.menu.selectedBackground
-  property color selectedText: Color.menu.selectedText
-  property color selectedBorder: Color.menu.selectedBorder
+  property color scrim: Commons.Color.menu.scrim
+  property color selectedBackground: Commons.Color.menu.selectedBackground
+  property color selectedText: Commons.Color.menu.selectedText
+  property color selectedBorder: Commons.Color.menu.selectedBorder
   property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", selectedBorder, 0)
   readonly property real rowReservedBorderLeft: Border.left(selectedBorderSpec)
   readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
@@ -639,7 +640,7 @@ Item {
             Text {
               width: parent.width
               text: root.lastError !== "" ? String.fromCodePoint(0xF0306) : "󰈉"
-              color: root.lastError !== "" ? Color.urgent : root.selectedText
+              color: root.lastError !== "" ? Commons.Color.urgent : root.selectedText
               opacity: 0.8
               font.family: root.fontFamily
               font.pixelSize: Style.font.displayLarge
@@ -658,7 +659,7 @@ Item {
                    : (root.entries.length === 0
                       ? "The store is empty. Add one with: pass insert <name>"
                       : "No matches for “" + root.filterText + "”"))
-              color: root.lastError !== "" ? Color.urgent : root.foreground
+              color: root.lastError !== "" ? Commons.Color.urgent : root.foreground
               opacity: root.lastError !== "" ? 1 : 0.7
               font.family: root.fontFamily
               font.pixelSize: Style.font.body

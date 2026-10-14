@@ -64,6 +64,12 @@ for qml in "$PLUGIN_DIR"/*.qml; do
     expected=$(grep -cE 'missing-property|signal-handler-parameters|uncreatable-type' <<<"$output")
     printf '  clean (%s expected singleton/signal warnings suppressed)\n' "$expected"
   fi
+
+  bare=$(grep -nE '(^|[^.A-Za-z_])Color\.' "$qml" || true)
+  if [[ -n $bare ]]; then
+    printf "  bare Color. resolves to QtQuick's own Color on Qt 6.12, not the shell's; use Commons.Color:\n%s\n" "$bare"
+    status=1
+  fi
 done
 
 exit "$status"
